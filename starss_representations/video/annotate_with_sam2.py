@@ -1,0 +1,361 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Detected bounding boxes with YOLOS
+"""
+
+from argparse import ArgumentParser
+from copy import deepcopy
+from pathlib import Path
+
+import cv2
+import pandas as pd
+import numpy as np
+import torch
+from transformers import YolosImageProcessor, YolosForObjectDetection
+from tqdm import tqdm
+
+from starss_representations import utils
+
+FOV = 90
+OUT_WIDTH, OUT_HEIGHT = 512, 512
+VIEWS = [
+    (-135, 0),
+    (-90, 0),
+    (-45, 0),
+    (0, 0),
+    (45, 0),
+    (90, 0),
+    (135, 0),
+    (180, 0)
+]
+
+VIDEO_OUTPUT_DIR = utils.get_project_root() / "outputs/video_dev_annotated_yolos"
+
+MODEL_NAME = "hustvl/yolos-small"
+feature_extractor = YolosImageProcessor.from_pretrained(MODEL_NAME)
+model = YolosForObjectDetection.from_pretrained(MODEL_NAME)
+
+# Set devices correctly
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Keep only bounding boxes that exceed this threshold
+thresh = 0.9
+desired_labels = [
+    "person",
+    "cell phone",
+    "sink",
+]
+desired_ids = [model.config.label2id[i] for i in desired_labels]
+
+
+def equirectangular_to_perspective(
+        fov: float,
+        theta: float,
+        phi: float,
+        height_in: float = utils.VIDEO_HEIGHT,
+        width_in: float = utils.VIDEO_WIDTH,
+        height_out: float = OUT_HEIGHT,
+        width_out: float = OUT_WIDTH,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute translation to map equirectangular input to perspective output.
+
+    theta is left/right angle, phi is up/down angle, both given in degrees
+    """
+    equ_cx = (width_in - 1) / 2.0
+    equ_cy = (height_in - 1) / 2.0
+
+    w_fov = fov
+    h_fov = float(height_out) / width_out * w_fov
+
+    w_len = np.tan(np.radians(w_fov / 2.0))
+    h_len = np.tan(np.radians(h_fov / 2.0))
+
+    x_map = np.ones([height_out, width_out], np.float32)
+    y_map = np.tile(np.linspace(-w_len, w_len, width_out), [height_out, 1])
+    z_map = -np.tile(np.linspace(-h_len, h_len, height_out), [width_out, 1]).T
+
+    d = np.sqrt(x_map ** 2 + y_map ** 2 + z_map ** 2)
+    xyz = np.stack((x_map, y_map, z_map), axis=2) / np.repeat(d[:, :, np.newaxis], 3, axis=2)
+
+    y_axis = np.array([0.0, 1.0, 0.0], np.float32)
+    z_axis = np.array([0.0, 0.0, 1.0], np.float32)
+    r1, _ = cv2.Rodrigues(z_axis * np.radians(theta))
+    r2, _ = cv2.Rodrigues(np.dot(r1, y_axis) * np.radians(-phi))
+
+    xyz = xyz.reshape([height_out * width_out, 3]).T
+    xyz = np.dot(r1, xyz)
+    xyz = np.dot(r2, xyz).T
+    lat = np.arcsin(xyz[:, 2])
+    lon = np.arctan2(xyz[:, 1], xyz[:, 0])
+
+    lon = lon.reshape([height_out, width_out]) / np.pi * 180
+    lat = -lat.reshape([height_out, width_out]) / np.pi * 180
+
+    lon = lon / 180 * equ_cx + equ_cx
+    lat = lat / 90 * equ_cy + equ_cy
+
+    return lon.astype(np.float32), lat.astype(np.float32)
+
+
+def perspective_bbox_to_equirectangular(bbox: np.ndarray, trans_x: np.ndarray, trans_y: np.ndarray) -> np.ndarray:
+    h, w = trans_x.shape
+    xmin, ymin, xmax, ymax, cls = bbox
+
+    # Clamp coordinates to valid pixel indices
+    x0, y0 = int(np.clip(xmin, 0, w - 1)), int(np.clip(ymin, 0, h - 1))
+    x1, y1 = int(np.clip(xmax, 0, w - 1)), int(np.clip(ymax, 0, h - 1))
+
+    # Get the equirectangular coordinates of the bbox corners
+    eq_x_min = trans_x[y0, x0]
+    eq_y_min = trans_y[y0, x0]
+    eq_x_max = trans_x[y1, x1]
+    eq_y_max = trans_y[y1, x1]
+
+    # Build the new bbox
+    return np.array([eq_x_min, eq_y_min, eq_x_max, eq_y_max, cls])
+
+
+def compute_bounding_boxes(perspective_image: np.ndarray) -> torch.Tensor:
+    """
+    Computes bounding boxes for an image (perspective format, square) using YOLOS model
+
+    Returns bounding boxes in the form (xmin, ymin, xmax, ymax) for any with predicted proba above threshold
+    and which are a target class from DCASE AudioSet-like labels
+    """
+    # Preprocess image
+    pixel_values = feature_extractor(perspective_image, return_tensors="pt").pixel_values
+
+    # Forwards pass through the model
+    with torch.no_grad():
+        outs = model(pixel_values.to(device), output_attentions=True)
+
+    # Compute predicted probabilities
+    probas = outs.logits.softmax(-1)[0, :, :-1]
+    keep = probas.max(-1).values > thresh
+
+    # Scale bounding boxes
+    target_sizes = torch.tensor(perspective_image.shape[:2]).unsqueeze(0)
+    postprocessed_outputs = feature_extractor.post_process(outs, target_sizes)
+    bboxes_scaled = postprocessed_outputs[0]['boxes']
+
+    # Compute class indices for all predictions at once
+    pred_classes = probas[keep].argmax(dim=1)
+
+    # Create a boolean mask selecting only desired classes
+    desired_mask = torch.isin(pred_classes, torch.tensor(desired_ids))
+
+    # Filter boxes to get only those with probability above threshold and which are a target class
+    #  also keep the class of the bbox
+    return torch.cat([bboxes_scaled[keep][desired_mask], pred_classes[desired_mask, None]], 1)
+
+
+def merge_bboxes(bboxes: np.ndarray, delta_x: float = 0.1, delta_y: float = 0.1) -> np.ndarray:
+    """
+    Merge multiple bounding boxes into one. Delta values are margins in width/height to merge.
+    """
+
+    def is_in_bbox(point: np.ndarray, bbox: np.ndarray) -> bool:
+        """
+        Returns True if point is inside box, False otherwise
+        """
+        return bbox[0] <= point[0] <= bbox[2] and bbox[1] <= point[1] <= bbox[3]
+
+    def intersect(bbox: np.ndarray, bbox_: np.ndarray) -> bool:
+        """
+        Returns True if boxes intersect, false otherwise
+        """
+        for i_ in range(int(len(bbox) / 2)):
+            for j_ in range(int(len(bbox) / 2)):
+                # Check if one of the corner of bbox inside bbox_
+                if is_in_bbox([bbox[2 * i_], bbox[2 * j_ + 1]], bbox_):
+                    return True
+        return False
+
+
+    # Sort bboxes by ymin
+    bboxes = sorted(bboxes, key=lambda x: x[1])
+
+    tmp_bbox = None
+    while True:
+        nb_merge = 0
+        used = []
+        new_bboxes = []
+
+        # Loop over bboxes
+        for i, b in enumerate(bboxes):
+            for j, b_ in enumerate(bboxes):
+
+                # If the bbox has already been used just continue
+                if i in used or j <= i:
+                    continue
+
+                # Compute the bboxes with a margin
+                bmargin = [
+                    b[0] - (b[2] - b[0]) * delta_x, b[1] - (b[3] - b[1]) * delta_y,
+                    b[2] + (b[2] - b[0]) * delta_x, b[3] + (b[3] - b[1]) * delta_y,
+                ]
+                b_margin = [
+                    b_[0] - (b_[2] - b_[0]) * delta_x, b_[1] - (b[3] - b[1]) * delta_y,
+                    b_[2] + (b_[2] - b_[0]) * delta_x, b_[3] + (b_[3] - b_[1]) * delta_y,
+                ]
+
+                # Merge bboxes if bboxes with margin have an intersection
+                #  Check if one of the corner is in the other bbox
+                #  We must verify the other side away in case one bounding box is inside the other
+                if intersect(bmargin, b_margin) or intersect(b_margin, bmargin):
+
+                    # Also only keep bboxes with the same class label
+                    if b[4] == b_[4]:
+
+                        tmp_bbox = [min(b[0], b_[0]), min(b[1], b_[1]), max(b_[2], b[2]), max(b[3], b_[3]), b[4]]
+                        used.append(j)
+                        nb_merge += 1
+
+                if tmp_bbox:
+                    b = tmp_bbox
+
+            if tmp_bbox:
+                new_bboxes.append(tmp_bbox)
+            elif i not in used:
+                new_bboxes.append(b)
+
+            used.append(i)
+            tmp_bbox = None
+
+        # If no merge were done, that means all bboxes were already merged
+        if nb_merge == 0:
+            break
+
+        # Make a copy to avoid modifying original object
+        bboxes = deepcopy(new_bboxes)
+
+    return np.array(new_bboxes)
+
+
+def sanitise_bboxes(bboxes: np.ndarray) -> np.ndarray:
+    """
+    Sanitise bounding boxes, removing those with invalid values
+    """
+    bboxes = np.array(bboxes)
+    mask_x = (bboxes[:, 2] - bboxes[:, 0]) > 0
+    mask_y = (bboxes[:, 3] - bboxes[:, 1]) > 0
+    mask_cls = np.isin(bboxes[:, -1].astype(int), np.array(desired_ids))
+    mask = np.logical_and.reduce((mask_x, mask_y, mask_cls))
+    return bboxes[mask]
+
+
+def process_video(input_file, output_file) -> None:
+    # Open the input video file for reading frames
+    cap = cv2.VideoCapture(str(input_file))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file {input_file}")
+
+    # Create output writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_writer = cv2.VideoWriter(output_file, fourcc, utils.VIDEO_FPS, utils.VIDEO_RES, isColor=True)
+
+    # Compute frame count
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Compute transforms for every desired view
+    trans = [equirectangular_to_perspective(FOV, x, y) for (x, y) in VIEWS]
+
+    video_bboxes = []
+    video_bboxes_raw = []
+
+    for n in tqdm(range(n_frames), desc="Processing frames..."):
+        # Get the frame at the current idx
+        cap.set(cv2.CAP_PROP_POS_FRAMES, n)
+        ret, frame = cap.read()
+
+        # Break once out of frames
+        if not ret:
+            break
+
+        frame_bboxes = []
+
+        for (trans_x, trans_y) in trans:
+            # Compute perspective view at current translation
+            persp = cv2.remap(
+                frame,
+                trans_x,
+                trans_y,
+                cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_WRAP
+            )
+
+            # Detect objects for current perspective
+            #  Boxes have the format (xmin, ymin, xmax, ymax, class)
+            bboxes_persp = compute_bounding_boxes(persp)
+
+            # Map bounding boxes back to equirectangular format with the transforms
+            frame_bboxes.extend([perspective_bbox_to_equirectangular(bb, trans_x, trans_y) for bb in bboxes_persp])
+
+        # Remove overlapping bboxes and those with invalid values
+        valid_bboxes = sanitise_bboxes(frame_bboxes)
+        formatted_bboxes = merge_bboxes(valid_bboxes)
+
+        # Draw all bounding boxes on frame
+        for (xmin, ymin, xmax, ymax, cls) in formatted_bboxes:
+            cv2.rectangle(frame, (round(xmin), round(ymin)), (round(xmax), round(ymax)), (0, 255, 0), 2)
+            cls_label = model.config.id2label[cls]
+            cv2.putText(frame, cls_label, (round(xmax + 10), round(ymax + 10)), 0, 0.3, (0, 255, 0))
+
+        # Write the frame
+        out_writer.write(frame)
+
+        # Append to the list, including the frame number
+        video_bboxes.extend([[n, *fb] for fb in formatted_bboxes.tolist()])
+        video_bboxes_raw.extend([[n, *fb] for fb in frame_bboxes])
+
+    # Dump the bboxes to a CSV file: raw and postprocessed
+    bbox_df = pd.DataFrame(video_bboxes, columns=["frame", "xmin", "ymin", "xmax", "ymax", "class"])
+    bbox_df.to_csv(output_file.with_suffix(".csv"), index=False)
+    bbox_raw_df = pd.DataFrame(video_bboxes_raw, columns=["frame", "xmin", "ymin", "xmax", "ymax", "class"])
+    bbox_raw_df.to_csv(str(output_file.with_suffix(".csv")).replace(".csv", "_raw.csv"), index=False)
+
+    # Close everything
+    cap.release()
+    out_writer.release()
+
+
+def main(input_files: list[str], output_dir: str):
+    # Create folder + subdirs if not existing
+    output_dir = Path(output_dir)
+    utils.create_output_dir_with_subdirs(output_dir, utils.DATA_SPLITS)
+
+    # Run the pipeline over every file in the input
+    for fi in tqdm(input_files, desc="Running pipeline..."):
+        # Skip over outputs that already exist
+        output_file = output_dir / f"{fi}.mp4"
+        if output_file.exists():
+            continue
+
+        input_file = utils.VIDEO_PATH / f"{fi}.mp4"
+        process_video(input_file, output_file)
+
+
+if __name__ == "__main__":
+    # Use module docstring for the help text
+    parser = ArgumentParser(description=__doc__)
+
+    # Here come the user parameters
+    parser.add_argument(
+        "--input-files",
+        type=str,
+        nargs="+",
+        help="The name of the input files to use without extensions, e.g. 'dev-test-tau/fold4_room23_mix002'",
+        default=utils.DESIRED_FILES,
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=VIDEO_OUTPUT_DIR,
+    )
+    vars__ = vars(parser.parse_args())
+
+    main(**vars__)

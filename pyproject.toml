@@ -13,6 +13,8 @@ numpy = "2.0.2"
 pandas = "2.2.2"
 tqdm="*"
 opencv-python = "*"
+torch = "*"
+transformers = "*"
 
 [build-system]
 requires = ["poetry-core"]

@@ -12,6 +12,7 @@ import cv2
 VIDEO_FPS = 29.97
 VIDEO_FRAME_TIME = 1 / VIDEO_FPS
 VIDEO_RES = (1920, 960)
+VIDEO_WIDTH, VIDEO_HEIGHT = VIDEO_RES
 VIDEO_RES_RESIZED = (960, 480)
 
 # Color measured in integers from 0 - 255
@@ -191,6 +192,20 @@ def spherical_to_pixel(azimuth: float, elevation: float, width: float, height: f
     y = max(0, min(height - 1, y))
 
     return x, y
+
+
+def interp2d(array: np.ndarray, n_out: int) -> np.ndarray:
+    # Build input and output time axes
+    n_in = len(array)
+    t_in = np.arange(n_in) * 0.1
+    duration = t_in[-1]
+    t_out = np.linspace(0, duration, n_out)
+
+    # Split into individual 1D arrays, interpolate all of them
+    ins = [np.interp(t_out, t_in, array[:, i]) for i in range(array.shape[1])]
+
+    # Stack back to 2D
+    return np.column_stack(ins)
 
 
 def combine_audio_and_video(video_path: str, audio_path: str, output_path: str, cleanup: bool = True) -> None:
