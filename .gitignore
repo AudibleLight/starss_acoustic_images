@@ -1,0 +1,9 @@
+*.mp4
+*.csv
+*.wav
+*.mp3
+
+# created by virtualenv automatically
+/venv
+/.idea
+/starss_representations/__pycache__

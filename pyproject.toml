@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "starss-representations"
+version = "0.1"
+authors = ["Huw Cheston <h.cheston@qmul.ac.uk>", "Iran Roman <i.roman@qmul.ac.uk>"]
+license = "CC-BY-4.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+librosa = "0.11.0"
+matplotlib = "*"
+numpy = "2.0.2"
+pandas = "2.2.2"
+tqdm="*"
+opencv-python = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
