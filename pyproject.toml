@@ -15,6 +15,10 @@ tqdm="*"
 opencv-python = "*"
 torch = "*"
 transformers = "*"
+scikit-image = "*"
+pyunlocbox = "*"
+astropy = "*"
+h5py = "*"
 
 [build-system]
 requires = ["poetry-core"]
