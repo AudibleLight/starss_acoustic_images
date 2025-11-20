@@ -18,22 +18,19 @@ from tqdm import tqdm
 
 from starss_representations import utils
 
+# Four non-overlapping views covering the entire sphere
 FOV = 90
 OUT_WIDTH, OUT_HEIGHT = 512, 512
 VIEWS = [
     (-135, 0),
-    (-90, 0),
     (-45, 0),
-    (0, 0),
     (45, 0),
-    (90, 0),
-    (135, 0),
-    (180, 0)
+    (135, 0)
 ]
 
 VIDEO_OUTPUT_DIR = utils.get_project_root() / "outputs/video_dev_annotated_yolos"
 
-MODEL_NAME = "hustvl/yolos-small"
+MODEL_NAME = "hustvl/yolos-base"
 feature_extractor = YolosImageProcessor.from_pretrained(MODEL_NAME)
 model = YolosForObjectDetection.from_pretrained(MODEL_NAME)
 
@@ -42,7 +39,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 # Keep only bounding boxes that exceed this threshold
-thresh = 0.9
+thresh = 0.7
 desired_labels = [
     "person",
     "cell phone",
@@ -119,38 +116,60 @@ def perspective_bbox_to_equirectangular(bbox: np.ndarray, trans_x: np.ndarray, t
     return np.array([eq_x_min, eq_y_min, eq_x_max, eq_y_max, cls])
 
 
-def compute_bounding_boxes(perspective_image: np.ndarray) -> torch.Tensor:
+def compute_bounding_boxes(perspective_images: np.ndarray) -> np.ndarray:
     """
-    Computes bounding boxes for an image (perspective format, square) using YOLOS model
-
-    Returns bounding boxes in the form (xmin, ymin, xmax, ymax) for any with predicted proba above threshold
-    and which are a target class from DCASE AudioSet-like labels
+    Computes bounding boxes for a batch of perspective images (square) using YOLOS.
     """
-    # Preprocess image
-    pixel_values = feature_extractor(perspective_image, return_tensors="pt").pixel_values
 
-    # Forwards pass through the model
+    # add batch dimension if not present initially
+    if perspective_images.ndim == 3:
+        perspective_images = perspective_images[None, ...]
+
+    b, h, w, c = perspective_images.shape
+
+    # Preprocess: batched pixel_values [B, C, H, W]
+    pixel_values = feature_extractor(perspective_images, return_tensors="pt").pixel_values
+
+    # Forward pass: shape (batch, patches, classes)
     with torch.no_grad():
         outs = model(pixel_values.to(device), output_attentions=True)
 
-    # Compute predicted probabilities
-    probas = outs.logits.softmax(-1)[0, :, :-1]
+    # Compute predicted probabilities along class dimension
+    probas = outs.logits.softmax(-1)
+
+    # Keep mask per image: (batch, patches)
     keep = probas.max(-1).values > thresh
 
-    # Scale bounding boxes
-    target_sizes = torch.tensor(perspective_image.shape[:2]).unsqueeze(0)
-    postprocessed_outputs = feature_extractor.post_process(outs, target_sizes)
-    bboxes_scaled = postprocessed_outputs[0]['boxes']
+    # Target sizes for scaling (H,W for each image)
+    target_sizes = torch.tensor([[h, w]]).repeat(b, 1).to(device)
 
-    # Compute class indices for all predictions at once
-    pred_classes = probas[keep].argmax(dim=1)
+    # Postprocess YOLOS outputs: list of dicts
+    postprocessed = feature_extractor.post_process(outs, target_sizes)
 
-    # Create a boolean mask selecting only desired classes
-    desired_mask = torch.isin(pred_classes, torch.tensor(desired_ids))
+    results = []
 
-    # Filter boxes to get only those with probability above threshold and which are a target class
-    #  also keep the class of the bbox
-    return torch.cat([bboxes_scaled[keep][desired_mask], pred_classes[desired_mask, None]], 1)
+    # need to iterate over all items in the "batch"
+    for i in range(b):
+        # (num_patches, 4), where 4 == (xmin, ymin, xmax, ymax)
+        boxes_scaled = postprocessed[i]["boxes"].cpu()
+        # (num_patches,)
+        pred_classes = probas[i].argmax(dim=1).cpu()
+
+        # Apply probability threshold filtering
+        k = keep[i].cpu()
+        boxes_k = boxes_scaled[k]
+        classes_k = pred_classes[k]
+
+        # Filter by desired class IDs
+        desired = torch.isin(classes_k, torch.tensor(desired_ids))
+        boxes_final = boxes_k[desired].cpu().numpy()
+        classes_final = classes_k[desired, None].cpu().numpy()
+
+        # Concatenate (xmin, ymin, xmax, ymax, class_id)
+        results.append(np.column_stack([boxes_final, classes_final]))
+
+    # return list with length B
+    return results
 
 
 def merge_bboxes(bboxes: np.ndarray, delta_x: float = 0.1, delta_y: float = 0.1) -> np.ndarray:
@@ -278,7 +297,8 @@ def process_video(input_file, output_file) -> None:
 
         frame_bboxes = []
 
-        for (trans_x, trans_y) in trans:
+        all_persp = np.zeros((len(trans), OUT_WIDTH, OUT_HEIGHT, 3))
+        for idx, (trans_x, trans_y) in enumerate(trans):
             # Compute perspective view at current translation
             persp = cv2.remap(
                 frame,
@@ -287,20 +307,26 @@ def process_video(input_file, output_file) -> None:
                 cv2.INTER_CUBIC,
                 borderMode=cv2.BORDER_WRAP
             )
+            all_persp[idx, :, :, :] = persp
 
-            # Detect objects for current perspective
-            #  Boxes have the format (xmin, ymin, xmax, ymax, class)
-            bboxes_persp = compute_bounding_boxes(persp)
+        # Detect objects for current perspective
+        #  Boxes have the format (xmin, ymin, xmax, ymax, class)
+        bboxes_persp = compute_bounding_boxes(all_persp)
 
-            # Map bounding boxes back to equirectangular format with the transforms
-            frame_bboxes.extend([perspective_bbox_to_equirectangular(bb, trans_x, trans_y) for bb in bboxes_persp])
+        # Map bounding boxes back to equirectangular format with the transforms
+        for bb, (trans_x, trans_y) in zip(bboxes_persp, trans):
+            frame_bboxes.extend([perspective_bbox_to_equirectangular(b, trans_x, trans_y) for b in bb])
+
+        # Skip over if no bounding boxes for this frame
+        if len(frame_bboxes) == 0:
+            continue
 
         # Remove overlapping bboxes and those with invalid values
         valid_bboxes = sanitise_bboxes(frame_bboxes)
-        formatted_bboxes = merge_bboxes(valid_bboxes)
+        # formatted_bboxes = merge_bboxes(valid_bboxes)
 
         # Draw all bounding boxes on frame
-        for (xmin, ymin, xmax, ymax, cls) in formatted_bboxes:
+        for (xmin, ymin, xmax, ymax, cls) in valid_bboxes:
             cv2.rectangle(frame, (round(xmin), round(ymin)), (round(xmax), round(ymax)), (0, 255, 0), 2)
             cls_label = model.config.id2label[cls]
             cv2.putText(frame, cls_label, (round(xmax + 10), round(ymax + 10)), 0, 0.3, (0, 255, 0))
@@ -309,7 +335,7 @@ def process_video(input_file, output_file) -> None:
         out_writer.write(frame)
 
         # Append to the list, including the frame number
-        video_bboxes.extend([[n, *fb] for fb in formatted_bboxes.tolist()])
+        video_bboxes.extend([[n, *fb] for fb in valid_bboxes.tolist()])
         video_bboxes_raw.extend([[n, *fb] for fb in frame_bboxes])
 
     # Dump the bboxes to a CSV file: raw and postprocessed
