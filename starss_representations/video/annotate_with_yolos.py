@@ -10,11 +10,13 @@ from copy import deepcopy
 from pathlib import Path
 
 import cv2
-import pandas as pd
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from transformers import YolosImageProcessor, YolosForObjectDetection
 from tqdm import tqdm
+from matplotlib.animation import FuncAnimation
 
 from starss_representations import utils
 
@@ -267,33 +269,39 @@ def sanitise_bboxes(bboxes: np.ndarray) -> np.ndarray:
     return bboxes[mask]
 
 
-def process_video(input_file, output_file) -> None:
-    # Open the input video file for reading frames
-    cap = cv2.VideoCapture(str(input_file))
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file {input_file}")
+def process_video(
+    input_file: str | Path,
+    output_file: str | Path = None,
+    fig: plt.Figure = None,
+    ax: plt.Axes = None,
+    add_frame: bool = True,
+    frame_cap: int = None,
+) -> FuncAnimation:
+    """
+    Process video and save animation if required
+    """
 
-    # Create output writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_writer = cv2.VideoWriter(output_file, fourcc, utils.VIDEO_FPS, utils.VIDEO_RES, isColor=True)
+    def update_video(frame_idx: int) -> plt.Axes:
+        """
+        Update the animation at the current index
+        """
+        if frame_idx % 10 == 0:
+            print(f"Frame {frame_idx} / {n_frames}...")
 
-    # Compute frame count
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # Clear the axis for the current frame
+        ax.clear()
 
-    # Compute transforms for every desired view
-    trans = [equirectangular_to_perspective(FOV, x, y) for (x, y) in VIEWS]
-
-    video_bboxes = []
-    video_bboxes_raw = []
-
-    for n in tqdm(range(n_frames), desc="Processing frames..."):
-        # Get the frame at the current idx
-        cap.set(cv2.CAP_PROP_POS_FRAMES, n)
+        # Get the current frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
 
         # Break once out of frames
         if not ret:
-            break
+            return ax
+
+        # Set the current image
+        if add_frame:
+            ax.imshow(frame)
 
         frame_bboxes = []
 
@@ -319,34 +327,68 @@ def process_video(input_file, output_file) -> None:
 
         # Skip over if no bounding boxes for this frame
         if len(frame_bboxes) == 0:
-            continue
+            return ax
 
         # Remove overlapping bboxes and those with invalid values
         valid_bboxes = sanitise_bboxes(frame_bboxes)
-        # formatted_bboxes = merge_bboxes(valid_bboxes)
 
-        # Draw all bounding boxes on frame
+        # Add all the bounding boxes in
         for (xmin, ymin, xmax, ymax, cls) in valid_bboxes:
-            cv2.rectangle(frame, (round(xmin), round(ymin)), (round(xmax), round(ymax)), (0, 255, 0), 2)
+            rect = mpatches.Rectangle(
+                (xmin, ymin),
+                xmax - xmin,
+                ymax - ymin,
+                facecolor="none",
+                edgecolor="red",
+                linewidth=2,
+                zorder=10000
+            )
             cls_label = model.config.id2label[cls]
-            cv2.putText(frame, cls_label, (round(xmax + 10), round(ymax + 10)), 0, 0.3, (0, 255, 0))
+            ax.text(
+                xmax + 10,
+                ymax + 10,
+                cls_label,
+                bbox=dict(facecolor='red', zorder=10000)
+            )
+            ax.add_patch(rect)
 
-        # Write the frame
-        out_writer.write(frame)
+        # Close everything after reaching the last frame
+        if frame_idx == n_frames - 1:
+            cap.release()
 
-        # Append to the list, including the frame number
-        video_bboxes.extend([[n, *fb] for fb in valid_bboxes.tolist()])
-        video_bboxes_raw.extend([[n, *fb] for fb in frame_bboxes])
+        return ax
 
-    # Dump the bboxes to a CSV file: raw and postprocessed
-    bbox_df = pd.DataFrame(video_bboxes, columns=["frame", "xmin", "ymin", "xmax", "ymax", "class"])
-    bbox_df.to_csv(output_file.with_suffix(".csv"), index=False)
-    bbox_raw_df = pd.DataFrame(video_bboxes_raw, columns=["frame", "xmin", "ymin", "xmax", "ymax", "class"])
-    bbox_raw_df.to_csv(str(output_file.with_suffix(".csv")).replace(".csv", "_raw.csv"), index=False)
 
-    # Close everything
-    cap.release()
-    out_writer.release()
+    # Create the figure + axis if not provided
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(1, 1)
+
+    # Open the input video file for reading frames
+    cap = cv2.VideoCapture(str(input_file))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file {input_file}")
+
+    # Compute frame count
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Compute transforms for every desired view
+    trans = [equirectangular_to_perspective(FOV, x, y) for (x, y) in VIEWS]
+
+    # Create the animation
+    fa = FuncAnimation(
+        fig,
+        update_video,
+        frames=n_frames if not frame_cap else frame_cap,
+        repeat=False,
+        # interval needs to be provided in milliseconds
+        interval=utils.VIDEO_FRAME_TIME * 1000
+    )
+    # Save the animation
+    if output_file is not None:
+        fa.save(output_file)
+
+    # Return the animation
+    return fa
 
 
 def main(input_files: list[str], output_dir: str):
@@ -358,8 +400,8 @@ def main(input_files: list[str], output_dir: str):
     for fi in tqdm(input_files, desc="Running pipeline..."):
         # Skip over outputs that already exist
         output_file = output_dir / f"{fi}.mp4"
-        if output_file.exists():
-            continue
+        # if output_file.exists():
+        #     continue
 
         input_file = utils.VIDEO_PATH / f"{fi}.mp4"
         process_video(input_file, output_file)

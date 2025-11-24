@@ -9,8 +9,10 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import cv2
-import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import pandas as pd
+from matplotlib.animation import FuncAnimation
 from tqdm import tqdm
 
 from starss_representations import utils
@@ -34,12 +36,17 @@ def format_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def create_annotations_map(metadata_fmt: pd.DataFrame) -> dict[int, dict]:
+def create_annotations_map(metadata) -> dict[int, dict]:
     """
     Prepare annotations for fast lookup by actual video frame index
 
     This process builds a dictionary mapping each video frame index to a list of annotations that apply to it.
     """
+    if isinstance(metadata, (str, Path)):
+        metadata = pd.read_csv(metadata)
+
+    metadata_fmt = format_df(metadata)
+
     frame_to_annotations_map = {}
     for idx, row in metadata_fmt.iterrows():
         # Calculate the start and end time of the label in seconds (from the metadata)
@@ -59,91 +66,105 @@ def create_annotations_map(metadata_fmt: pd.DataFrame) -> dict[int, dict]:
     return frame_to_annotations_map
 
 
-def annotate_frame(frame: np.ndarray, annotations: list[dict]) -> np.ndarray:
-    """
-    Applies annotation to a given frame at an index
-    """
-    width, height = frame.shape[1], frame.shape[0]
-
-    for annotation_row in annotations:
-        # Extract pixel coordinates, distance multiplier, and active class from the annotation
-        x, y = utils.spherical_to_pixel(
-            annotation_row["azimuth"],
-            annotation_row["elevation"],
-            width,
-            height
-        )
-        distance_multiplier = annotation_row["distance_multiplier"]
-        active_class = utils.LABEL_MAPPING_INV[annotation_row["active_class_idx"]]
-
-        # Calculate annotation color based on distance (closer = darker color)
-        color_val = int(utils.MAX_COLOR * distance_multiplier) + 10
-        color_val = utils.MAX_COLOR - color_val
-
-        # Draw a circle at the annotated location (OpenCV uses BGR color format)
-        frame = cv2.circle(
-            frame,
-            (x, y),
-            radius=5,
-            color=(color_val, 50, 50),
-            thickness=2
-        )
-
-        # Add text label for the active class
-        frame = cv2.putText(
-            frame,
-            active_class,
-            (x + 10, y + 10),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.5,
-            color=(color_val, 50, 50),
-            thickness=2
-        )
-
-    return frame
-
-
 # noinspection PyUnresolvedReferences
-def process_video(filename: str, annotations_map: dict[int, dict]) -> None:
+def process_video(
+    input_file: str | Path,
+    annotations_map: dict[int, dict],
+    output_file: str | Path = None,
+    fig: plt.Figure = None,
+    ax: plt.Axes = None,
+    add_frame: bool = True,
+    frame_cap: int = None
+) -> FuncAnimation:
     """
     Process a video frame-by-frame with all annotations
     """
+    def update_video(frame_idx: int):
+        if frame_idx % 100 == 0:
+            print(f"Frame {frame_idx} / {n_frames}...")
 
-    # Open the input video file for reading frames
-    input_video_path = utils.VIDEO_PATH / f"{filename}.mp4"
-    cap = cv2.VideoCapture(str(input_video_path))
-    if not cap.isOpened():
-        raise ValueError(f"Could not open video file {input_video_path}")
+        # Clear the axis for the current frame
+        ax.clear()
 
-    # Open an output video writer to save the annotated frames to a temporary file
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Define the video codec
-    # The output video will be color (isColor=True) to allow for color annotations
-    out_writer = cv2.VideoWriter(TEMP_OUTPUT_NAME, fourcc, utils.VIDEO_FPS, utils.VIDEO_RES, isColor=True)
-
-    if not out_writer.isOpened():
-        cap.release()  # Release the input video capture if output writer fails
-        raise ValueError("Could not open video writer.")
-
-    current_video_frame_idx = 0
-    while True:
-        # Read a single frame from the input video
+        # Get the current frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
 
-        # Break the loop if no more frames are returned (end of video)
         if not ret:
-            break
+            return ax
 
-        # Check if there are any annotations that apply to the current video frame
-        if current_video_frame_idx in annotations_map.keys():
-            frame = annotate_frame(frame, annotations_map[current_video_frame_idx])
+        if add_frame:
+            ax.imshow(frame)
 
-        # Write the (potentially) annotated frame to the temporary output video
-        out_writer.write(frame)
-        current_video_frame_idx += 1
+        if frame_idx not in annotations_map.keys():
+            return ax
 
-    # Release the video capture and writer objects after processing each video
-    cap.release()
-    out_writer.release()
+        width, height = frame.shape[1], frame.shape[0]
+        annotations = annotations_map[frame_idx]
+
+        for annotation_row in annotations:
+            # Extract pixel coordinates, distance multiplier, and active class from the annotation
+            x, y = utils.spherical_to_pixel(
+                annotation_row["azimuth"],
+                annotation_row["elevation"],
+                width,
+                height
+            )
+            active_class = utils.LABEL_MAPPING_INV[annotation_row["active_class_idx"]]
+
+            # Draw a circle at the annotated location
+            ellip = mpatches.Ellipse(
+                (x, y),
+                width=10,
+                height=10,
+                edgecolor="red",
+                linewidth=2,
+                facecolor="none",
+                zorder=10000
+            )
+            ax.add_patch(ellip)
+
+            # Add text label for the active class
+            ax.text(
+                x + 10,
+                y + 10,
+                active_class,
+                bbox=dict(facecolor='red', zorder=10000)
+            )
+
+        # Close everything after reaching the last frame
+        if frame_idx == n_frames - 1:
+            cap.release()
+
+        return ax
+
+
+    # Create the figure and axis if not provided
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(1, 1)
+
+    # Open the input video file for reading frames
+    cap = cv2.VideoCapture(str(input_file))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file {input_file}")
+
+    # Compute frame count
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Create and save the animation
+    fa = FuncAnimation(
+        fig,
+        update_video,
+        # frames=200,
+        frames=n_frames if not frame_cap else frame_cap,
+        repeat=False,
+        # interval needs to be provided in milliseconds
+        interval=utils.VIDEO_FRAME_TIME * 1000
+    )
+    if output_file is not None:
+        fa.save(output_file)
+
+    return fa
 
 
 def main(input_files: list[str], output_dir: str) -> None:
@@ -155,27 +176,27 @@ def main(input_files: list[str], output_dir: str) -> None:
     for fi in tqdm(input_files, desc="Running pipeline..."):
         # Skip over outputs that already exist
         output_file = output_dir / f"{fi}.mp4"
-        if output_file.exists():
-            continue
+        # if output_file.exists():
+        #     continue
 
         # Load metadata and format it
         metadata = pd.read_csv(utils.METADATA_PATH / f"{fi}.csv")
-        metadata_fmt = format_df(metadata)
 
         # Prepare annotations for fast lookup by actual video frame index
         # This process builds a dictionary mapping each video frame index to a list of annotations that apply to it.
-        frame_to_annotations_map = create_annotations_map(metadata_fmt)
+        frame_to_annotations_map = create_annotations_map(metadata)
 
         # Process the video
-        process_video(fi, frame_to_annotations_map)
+        inpt = utils.VIDEO_PATH / f"{fi}.mp4"
+        process_video(input_file=inpt, output_file=output_file, annotations_map=frame_to_annotations_map)
 
-        # Use ffmpeg to combine the temporary annotated video with its original audio track
-        utils.combine_audio_and_video(
-            video_path=TEMP_OUTPUT_NAME,
-            audio_path=utils.AUDIO_PATH / f"{fi}.wav",
-            output_path=output_file,
-            cleanup=True
-        )
+        # # Use ffmpeg to combine the temporary annotated video with its original audio track
+        # utils.combine_audio_and_video(
+        #     video_path=TEMP_OUTPUT_NAME,
+        #     audio_path=utils.AUDIO_PATH / f"{fi}.wav",
+        #     output_path=output_file,
+        #     cleanup=True
+        # )
 
 
 if __name__ == "__main__":

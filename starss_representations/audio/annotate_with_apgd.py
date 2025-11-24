@@ -868,7 +868,8 @@ def get_visibility_matrix(
     apgd: bool = False,
     t_sti: float = 10e-3,
     scale: str = "linear",
-    nbands: int = 9
+    nbands: int = 9,
+    frame_cap: int = None
 ) -> tuple:
     """
     Compute visibility matrix from audio data.
@@ -883,9 +884,9 @@ def get_visibility_matrix(
     # --- Frequency band creation ---
     print("[1/6] Computing frequency bands...")
     if scale == "linear":
-        freq, bw = (
+        freq = (
             skutil
-            .view_as_windows(np.linspace(1500, 4500, nbands), (2,), 1)
+            .view_as_windows(np.linspace(1500, 4500, nbands + 1), (2,), 1)
             .mean(axis=-1)
         )
         bw = 50.0
@@ -922,6 +923,12 @@ def get_visibility_matrix(
         print("    → Computing visibility matrices...")
         s = form_visibility(audio_in, fs, freq[i], bw, t_sti, t_stationarity)
         n_sample = s.shape[0]
+
+        # Cap frames if required
+        if frame_cap:
+            s = s[:frame_cap, :, :]
+            n_sample = frame_cap
+
         print(f"    → Visibility frames: {n_sample}")
 
         visibilities_per_frame = []
@@ -973,7 +980,14 @@ def get_visibility_matrix(
     return vis_arr, apgd_arr, r
 
 
-def generate_acoustic_map_video(apgd_arr: np.ndarray, r: np.ndarray, ts: float, f_out: str) -> None:
+def generate_acoustic_map_video(
+    apgd_arr: np.ndarray,
+    r: np.ndarray,
+    ts: float,
+    f_out: str | Path = None,
+    fig: plt.Figure = None,
+    ax: plt.Figure = None
+) -> FuncAnimation:
     """
     Generate acoustic map as video
     """
@@ -996,11 +1010,13 @@ def generate_acoustic_map_video(apgd_arr: np.ndarray, r: np.ndarray, ts: float, 
             show_axis=True
         )
 
-        ax.set_title(f"Frame {frame_idx}")
+        # ax.set_title(f"Frame {frame_idx}")
 
         return ax
 
-    fig, ax = plt.subplots(1, 1)
+    # Create figure and axis if not already existing
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(1, 1)
 
     # Need to plot the first frame
     _ = update(0)
@@ -1013,7 +1029,10 @@ def generate_acoustic_map_video(apgd_arr: np.ndarray, r: np.ndarray, ts: float, 
         interval=ts,
         repeat=False
     )
-    anim.save(f_out)
+    if f_out is not None:
+        anim.save(f_out)
+
+    return anim
 
 
 def main(data_src: str, outpath: str) -> None:
