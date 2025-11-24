@@ -49,41 +49,48 @@ LABEL_MAPPING = {
 }
 LABEL_MAPPING_INV = {v: k for k, v in LABEL_MAPPING.items()}
 
-# Only using first two files from every room for now
 DESIRED_FILES = [
-    'dev-test-sony/fold4_room23_mix002',
-    'dev-test-sony/fold4_room23_mix001',
-    'dev-test-sony/fold4_room24_mix002',
-    'dev-test-sony/fold4_room24_mix001',
-    'dev-train-sony/fold3_room21_mix013',
-    'dev-train-sony/fold3_room21_mix014',
-    'dev-train-sony/fold3_room22_mix002',
-    'dev-train-sony/fold3_room22_mix001',
-    'dev-test-tau/fold4_room15_mix001',
-    'dev-test-tau/fold4_room15_mix002',
-    'dev-test-tau/fold4_room16_mix001',
-    'dev-test-tau/fold4_room16_mix002',
-    'dev-test-tau/fold4_room10_mix001',
-    'dev-test-tau/fold4_room10_mix002',
-    'dev-test-tau/fold4_room2_mix001',
-    'dev-test-tau/fold4_room2_mix002',
-    'dev-test-tau/fold4_room8_mix001',
-    'dev-test-tau/fold4_room8_mix002',
-    'dev-train-tau/fold3_room12_mix001',
-    'dev-train-tau/fold3_room12_mix002',
-    'dev-train-tau/fold3_room13_mix001',
-    'dev-train-tau/fold3_room13_mix002',
-    'dev-train-tau/fold3_room14_mix001',
-    'dev-train-tau/fold3_room14_mix002',
-    'dev-train-tau/fold3_room4_mix001',
-    'dev-train-tau/fold3_room4_mix004',
-    'dev-train-tau/fold3_room6_mix001',
-    'dev-train-tau/fold3_room6_mix002',
-    'dev-train-tau/fold3_room7_mix001',
-    'dev-train-tau/fold3_room7_mix002',
-    'dev-train-tau/fold3_room9_mix001',
-    'dev-train-tau/fold3_room9_mix002',
+    "dev-test-tau/fold4_room8_mix004",
+    "dev-train-tau/fold3_room6_mix001",
+    "dev-train-tau/fold3_room14_mix003"
 ]
+
+
+# Only using first two files from every room for now
+# DESIRED_FILES = [
+#     'dev-test-sony/fold4_room23_mix002',
+#     'dev-test-sony/fold4_room23_mix001',
+#     'dev-test-sony/fold4_room24_mix002',
+#     'dev-test-sony/fold4_room24_mix001',
+#     'dev-train-sony/fold3_room21_mix013',
+#     'dev-train-sony/fold3_room21_mix014',
+#     'dev-train-sony/fold3_room22_mix002',
+#     'dev-train-sony/fold3_room22_mix001',
+#     'dev-test-tau/fold4_room15_mix001',
+#     'dev-test-tau/fold4_room15_mix002',
+#     'dev-test-tau/fold4_room16_mix001',
+#     'dev-test-tau/fold4_room16_mix002',
+#     'dev-test-tau/fold4_room10_mix001',
+#     'dev-test-tau/fold4_room10_mix002',
+#     'dev-test-tau/fold4_room2_mix001',
+#     'dev-test-tau/fold4_room2_mix002',
+#     'dev-test-tau/fold4_room8_mix001',
+#     'dev-test-tau/fold4_room8_mix002',
+#     'dev-train-tau/fold3_room12_mix001',
+#     'dev-train-tau/fold3_room12_mix002',
+#     'dev-train-tau/fold3_room13_mix001',
+#     'dev-train-tau/fold3_room13_mix002',
+#     'dev-train-tau/fold3_room14_mix001',
+#     'dev-train-tau/fold3_room14_mix002',
+#     'dev-train-tau/fold3_room4_mix001',
+#     'dev-train-tau/fold3_room4_mix004',
+#     'dev-train-tau/fold3_room6_mix001',
+#     'dev-train-tau/fold3_room6_mix002',
+#     'dev-train-tau/fold3_room7_mix001',
+#     'dev-train-tau/fold3_room7_mix002',
+#     'dev-train-tau/fold3_room9_mix001',
+#     'dev-train-tau/fold3_room9_mix002',
+# ]
 DATA_SPLITS = [
     "dev-train-tau",
     "dev-test-tau",
@@ -102,6 +109,7 @@ STARSS_ROOT = get_project_root() / "data"
 VIDEO_PATH = STARSS_ROOT / "video_dev"
 AUDIO_PATH = STARSS_ROOT / "foa_dev"
 METADATA_PATH = STARSS_ROOT / "metadata_dev"
+EIGEN_PATH = STARSS_ROOT / "eigen_dev"
 
 
 def load_video(
