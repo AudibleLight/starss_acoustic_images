@@ -1,12 +1,24 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Create acoustic map using APGD for an audio file
+"""
+
 import math
 import pandas as pd
-import random
 import time
 from argparse import ArgumentParser
+from collections.abc import Sized, Iterable
 from pathlib import Path
 
 import astropy.coordinates as coord
 import astropy.units as u
+import matplotlib.colors as cm
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import matplotlib.tri as tri
+import mpl_toolkits.basemap as basemap
 import numpy as np
 import librosa
 import skimage.util as skutil
@@ -19,7 +31,9 @@ import scipy.io.wavfile as wavfile
 import pyunlocbox as opt
 from pyunlocbox.functions import dummy
 from tqdm import tqdm
-from h5py import File
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from matplotlib.animation import FuncAnimation
 
 from starss_representations import utils
 
@@ -59,7 +73,7 @@ EIGENMIKE_COORDS = {
     "32": [159, 271, 0.042],
 }
 DEFAULT_EIGEN_DIRECTORY = utils.get_project_root() / "data/eigen_dev"
-DEFAULT_OUTPATH = utils.get_project_root() / "outputs/eigen_dev/apgd.hdf"
+DEFAULT_OUTPATH = utils.get_project_root() / "outputs/eigen_dev_apgd_map"
 
 
 def _deg2rad(coords_dict):
@@ -161,6 +175,8 @@ def nyquist_rate(xyz, wl):
 
 
 def fibonacci(n, direction=None, fo_v=None):
+    # This is the type of tesselation that we are using
+
     if direction is not None:
         direction = np.array(direction, dtype=float)
         direction /= linalg.norm(direction)
@@ -187,14 +203,21 @@ def fibonacci(n, direction=None, fo_v=None):
         mask = (direction @ xyz) >= min_similarity
         xyz = xyz[:, mask]
 
+    # these are the cartesian coordinates of the tesselation
+    #  need to turn this into azimuth + elevation
+    #  need to do the inverse of this: cart2pol
+    #  sphere will have fewer points at the poles than expected
+    #  to fill these, we need to do another interpolation
     return xyz
 
 
 def get_field():
+    # TODO: this is what we need to mess with
     sh_order = 10
     r = fibonacci(sh_order)
     r_mask = np.abs(r[2, :]) < np.sin(np.deg2rad(90))
     r = r[:, r_mask]  # Shrink visible view to avoid border effects.
+    # this is cartesian coordinates: (3, n_px)
     return r
 
 
@@ -482,7 +505,7 @@ def _solve(functions, x0, solver=None, atol=None, dtol=None, rtol=1e-3, xtol=Non
             if relative < rtol and not rtol_only_zeros:
                 crit = 'RTOL'
         if xtol is not None:
-            err = np.linalg.norm(solver.sol - last_sol)
+            err = np.linalg.norm(solver.sol - last_sol)    # noqa
             err /= np.sqrt(last_sol.size)
             if err < xtol:
                 crit = 'XTOL'
@@ -498,7 +521,7 @@ def _solve(functions, x0, solver=None, atol=None, dtol=None, rtol=1e-3, xtol=Non
 
     if verbosity in ['LOW', 'HIGH', 'ALL']:
         print('Solution found after {} iterations:'.format(niter))
-        print('    objective function f(sol) = {:e}'.format(current))
+        print('    objective function f(sol) = {:e}'.format(current))    # noqa
         print('    stopping criterion: {}'.format(crit))
 
     # Returned dictionary.
@@ -609,7 +632,247 @@ def form_visibility(data, rate, fc, bw, t_sti, t_stationarity):
     )
 
 
-def get_visibility_matrix(audio_in, fs, apgd=False, t_sti=10e-3, scale="linear", nbands=9):
+# noinspection PyUnresolvedReferences
+def wrapped_rad2deg(lat_r: np.ndarray, lon_r: np.ndarray) -> tuple:
+    """
+    Equatorial coordinate [rad] -> [deg] unit conversion.
+    Output longitude guaranteed to lie in [-180, 180) [deg].
+    """
+    lat_d = coord.Angle(lat_r * u.rad).to_value(u.deg)
+    lon_d = coord.Angle(lon_r * u.rad).wrap_at(180 * u.deg).to_value(u.deg)
+    return lat_d, lon_d
+
+
+# noinspection PyUnresolvedReferences
+def cart2pol(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple:
+    """
+    Cartesian coordinates to Polar coordinates.
+    """
+    cart = coord.CartesianRepresentation(x, y, z)
+    sph = coord.SphericalRepresentation.from_cartesian(cart)
+
+    r = sph.distance.to_value(u.dimensionless_unscaled)
+    colat = u.Quantity(90 * u.deg - sph.lat).to_value(u.rad)
+    lon = u.Quantity(sph.lon).to_value(u.rad)
+
+    return r, colat, lon
+
+
+def cart2eq(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple:
+    """
+    Cartesian coordinates to Equatorial coordinates.
+    """
+    r, colat, lon = cart2pol(x, y, z)
+    lat = (np.pi / 2) - colat
+    return r, lat, lon
+
+
+def cmap_from_list(name: list, colors: list, n: int = 256, gamma: float = 1.0):
+    """
+    Create segmented colormap from list of colors.
+    """
+
+    if not isinstance(colors, Iterable):
+        raise ValueError('colors must be iterable')
+
+    # List of value, color pairs
+    if (
+        isinstance(colors[0], Sized) and
+        (len(colors[0]) == 2) and
+        (not isinstance(colors[0], str))
+    ):
+        vals, colors = zip(*colors)
+    else:
+        vals = np.linspace(0, 1, len(colors))
+
+    cdict = dict(red=[], green=[], blue=[], alpha=[])
+    for val, color in zip(vals, colors):
+        r, g, b, a = cm.to_rgba(color)
+        cdict['red'].append((val, r, r))
+        cdict['green'].append((val, g, g))
+        cdict['blue'].append((val, b, b))
+        cdict['alpha'].append((val, a, a))
+
+    return cm.LinearSegmentedColormap(name, cdict, n, gamma)
+
+
+def draw_ellipse(position, covariance, ax=None, **kwargs):
+    """
+    Draw an ellipse with a given position and covariance
+    """
+    ax = ax or plt.gca()
+    # Convert covariance to principal axes
+    if covariance.shape == (2, 2):
+        u_, s, vt = np.linalg.svd(covariance)
+        angle = np.degrees(np.arctan2(u_[1, 0], u_[0, 0]))
+        width, height = 2 * np.sqrt(s)
+        print(width, height)
+    else:
+        angle = 0
+        width, height = 2 * np.sqrt(covariance)
+
+    # Draw the Ellipse
+    for nsig in range(1, 4):
+        ell =  mpatches.Ellipse(
+            position,
+            nsig * width,
+            nsig * height,
+            angle,
+            **kwargs
+        )
+        print("Width", ell.width)
+        ax.add_patch(ell)
+
+
+def plot_gmm(
+        gmm: GaussianMixture,
+        x: np.ndarray,
+        label: bool = True,
+        ax: plt.Axes = None
+) -> None:
+    """
+    Plot gaussian mixture model
+    """
+    ax = ax or plt.gca()
+    labels = gmm.fit(x).predict(x)    # noqa
+    if label:
+        ax.scatter(x[:, 0], x[:, 1], c=labels, s=40, cmap='viridis', zorder=2)
+    else:
+        ax.scatter(x[:, 0], x[:, 1], s=40, zorder=2)
+    ax.axis('equal')
+
+    w_factor = 0.2 / gmm.weights_.max()
+    for pos, covar, w in zip(gmm.means_, gmm.covariances_, gmm.weights_):
+        draw_ellipse(pos, covar, alpha=w * w_factor)
+
+
+def draw_map(
+        i: np.ndarray,
+        r: np.ndarray,
+        lon_ticks: np.ndarray,
+        show_labels: bool = False,
+        show_axis: bool = False,
+        fig: plt.Figure = None,
+        ax: plt.Axes = None,
+        kmeans: bool = False,
+        gaussian_mixture: bool = False
+) -> tuple:
+    """
+    Draw acoustic map.
+    """
+
+    _, r_el, r_az = cart2eq(*r)
+    r_el, r_az = wrapped_rad2deg(r_el, r_az)
+    r_el_min, r_el_max = np.around([np.min(r_el), np.max(r_el)])
+    r_az_min, r_az_max = np.around([np.min(r_az), np.max(r_az)])
+
+    # fig, ax = plt.subplots()
+    bm = basemap.Basemap(
+        projection='mill',
+        llcrnrlat=r_el_min,
+        urcrnrlat=r_el_max,
+        llcrnrlon=r_az_min,
+        urcrnrlon=r_az_max,
+        resolution='c',
+        ax=ax
+    )
+
+    if show_axis:
+        bm_labels = [1, 0, 0, 1]
+    else:
+        bm_labels = [0, 0, 0, 0]
+    bm.drawparallels(
+        np.linspace(r_el_min, r_el_max, 5),
+        color='w',
+        dashes=[1, 0],
+        labels=bm_labels,
+        labelstyle='+/-',
+        textcolor='#565656',
+        zorder=0,
+        linewidth=2
+    )
+    bm.drawmeridians(
+        lon_ticks,
+        color='w',
+        dashes=[1, 0],
+        labels=bm_labels,
+        labelstyle='+/-',
+        textcolor='#565656',
+        zorder=0,
+        linewidth=2
+    )
+
+    if show_labels:
+        ax.set_xlabel('Azimuth (degrees)', labelpad=20)
+        ax.set_ylabel('Elevation (degrees)', labelpad=40)
+
+    r_x, r_y = bm(r_az, r_el)
+    triangulation = tri.Triangulation(r_x, r_y)
+
+    n_px = i.shape[1]
+    mycmap = cmap_from_list('mycmap', i.T, n=n_px)
+    colors_cmap = np.arange(n_px)
+    ax.tripcolor(
+        triangulation,
+        colors_cmap,
+        cmap=mycmap,
+        shading='gouraud',
+        alpha=0.9,
+        edgecolors='w',
+        linewidth=0.1
+    )
+
+    cluster_center = None
+    if kmeans:
+        npts = 18  # find N maximum points
+        i_s = np.square(i).sum(axis=0)
+        max_idx = i_s.argsort()[-npts:][::-1]
+        x_y = np.column_stack((r_x[max_idx], r_y[max_idx]))  # stack N max energy points
+        km_res = KMeans(n_clusters=3).fit(x_y)  # apply k-means to max points
+        # get center of the cluster of N points
+        clusters = km_res.cluster_centers_    # noqa
+        ax.scatter(r_x[max_idx], r_y[max_idx], c='b', s=5)  # plot all N points
+        ax.scatter(clusters[:, 0], clusters[:, 1], s=500, alpha=0.3)  # plot the center as a large point
+        cluster_center = bm(clusters[:, 0][0], clusters[:, 1][0], inverse=True)
+
+    # compute Gaussian Mixture model
+    elif gaussian_mixture:
+        npts = 18
+        i_s = np.square(i).sum(axis=0)
+        max_idx = i_s.argsort()[-npts:][::-1]
+        x_y = np.column_stack((r_x[max_idx], r_y[max_idx]))  # stack N max energy points
+        gmm = GaussianMixture(n_components=1, random_state=42)
+        plot_gmm(gmm, x_y)
+
+    return fig, ax, cluster_center
+
+
+def to_rgb(i: np.ndarray) -> np.ndarray:
+    """
+    Convert real-valued intensity array (per frequency) with shape (N_band, N_px) to color-band array (3, N_px)
+
+    If N_band > 9, set N_band == 9
+    """
+    n_px = i.shape[1]
+    # Create a copy of the input array if it's going to be modified
+    i_copy = i.copy()
+    if i.shape[0] != 9:
+        i_copy = i_copy[1:10, :]  # grab 9 frequency bands
+    # Reshape and sum to get (3, N_px)
+    return i_copy.reshape((3, 3, n_px)).sum(axis=1)
+
+
+def get_visibility_matrix(
+    audio_in: np.ndarray,
+    fs: int,
+    apgd: bool = False,
+    t_sti: float = 10e-3,
+    scale: str = "linear",
+    nbands: int = 9
+) -> tuple:
+    """
+    Compute visibility matrix from audio data.
+    """
 
     print("\n=== get_visibility_matrix START ===")
     print(f"Sampling rate: {fs}")
@@ -620,11 +883,15 @@ def get_visibility_matrix(audio_in, fs, apgd=False, t_sti=10e-3, scale="linear",
     # --- Frequency band creation ---
     print("[1/6] Computing frequency bands...")
     if scale == "linear":
-        freq, bw = (skutil
-                    .view_as_windows(np.linspace(1500, 4500, nbands), (2,), 1)
-                    .mean(axis=-1)), 50.0
+        freq, bw = (
+            skutil
+            .view_as_windows(np.linspace(1500, 4500, nbands), (2,), 1)
+            .mean(axis=-1)
+        )
+        bw = 50.0
     elif scale == "log":
-        freq, bw = librosa.mel_frequencies(n_mels=nbands, fmin=50, fmax=4500), 50
+        freq = librosa.mel_frequencies(n_mels=nbands, fmin=50, fmax=4500)
+        bw = 50
     else:
         raise Exception("Not a valid scale to generate covariance matrices (log, linear)")
     print(f" → Freq bands: {freq.shape}, Bandwidth: {bw}")
@@ -679,8 +946,13 @@ def get_visibility_matrix(audio_in, fs, apgd=False, t_sti=10e-3, scale="linear",
             visibilities_per_frame.append(s_norm)
 
             if apgd:
-                i_apgd = solve(s_norm, a, gamma=apgd_gamma, x0=i_prev.copy(),
-                               verbosity='NONE')
+                i_apgd = solve(
+                    s_norm,
+                    a,
+                    gamma=apgd_gamma,
+                    x0=i_prev.copy(),
+                    verbosity='NONE'
+                )
                 apgd_per_band[s_idx] = i_apgd['sol']
                 i_prev = i_apgd['sol']
             else:
@@ -691,67 +963,101 @@ def get_visibility_matrix(audio_in, fs, apgd=False, t_sti=10e-3, scale="linear",
 
     print("\n[6/6] Final assembly...")
     vis_arr = np.array(visibilities)
+    # bands, frames, number of interpolated pixels -> need the tesselation
     apgd_arr = np.array(apgd_map)
 
     print(f" → Visibility array shape: {vis_arr.shape}")
     print(f" → APGD map shape: {apgd_arr.shape}")
     print("=== get_visibility_matrix END ===\n")
 
-    return vis_arr, apgd_arr
+    return vis_arr, apgd_arr, r
+
+
+def generate_acoustic_map_video(apgd_arr: np.ndarray, r: np.ndarray, ts: float, f_out: str) -> None:
+    """
+    Generate acoustic map as video
+    """
+    def update(frame_idx):
+        ax.clear()
+
+        # prepare intensity map for this frame
+        vs__ = apgd_arr[:, frame_idx, :]  # (9, N_px)
+        apgd_map_vs__ = to_rgb(vs__)
+        apgd_map_vs__ /= apgd_map_vs__.max()
+
+        # redraw frame
+        draw_map(
+            r=r,
+            i=apgd_map_vs__,
+            lon_ticks=np.linspace(-180, 180, 5),
+            fig=fig,
+            ax=ax,
+            show_labels=True,
+            show_axis=True
+        )
+
+        ax.set_title(f"Frame {frame_idx}")
+
+        return ax
+
+    fig, ax = plt.subplots(1, 1)
+
+    # Need to plot the first frame
+    _ = update(0)
+
+    # Create the animation
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=apgd_arr.shape[1],
+        interval=ts,
+        repeat=False
+    )
+    anim.save(f_out)
 
 
 def main(data_src: str, outpath: str) -> None:
     eigenmike_files = [p for p in Path(data_src).rglob("**/*.wav") if "._" not in str(p)]
 
     # Sanitise output directory
-    outdir = Path(outpath).parent
+    outdir = Path(outpath)
     if not outdir.exists():
         outdir.mkdir(parents=True)
 
-    # logarithmically space duration from 10ms to 2sec, rounded to 3 dp
-    t_logs_spaced = np.logspace(np.log10(20e-3), np.log10(200e-3),9)
-    t_logs_spaced = np.round(t_logs_spaced, 3)
+    # logarithmically space duration from 2sec to 10ms, rounded to 3 dp
+    t_logs_spaced = np.logspace(np.log10(1e-3), np.log10(0.2), 9)
+    t_logs_spaced = np.round(t_logs_spaced, 3)[::-1]
 
-    vg_labels = []
-    apgd_labels = []
-    t_sti_list = []
+    # Iterate over every audio file
+    for clip_name in tqdm(eigenmike_files, desc="Processing files..."):
 
-    with File(outpath, "w") as f:
-        for clip_name in tqdm(eigenmike_files, desc="Processing files..."):
-            t_sti = random.choice(t_logs_spaced)
-            sr, eigen_sig = wavfile.read(clip_name)
+        # Load in the WAV file
+        sr, eigen_sig = wavfile.read(clip_name)
 
-            # visibility graph matrix 32ch
-            vsg_sig, apgd = get_visibility_matrix(
+        # Iterate over every timescale
+        for t_sti in t_logs_spaced:
+
+            # Set filepath for this timescale + clip
+            file_outpath = f"{outdir}/{str(clip_name).split('/')[-1].split('.')[0]}_{round(t_sti * 10000)}ms.mp4"
+
+            # compute visibility graph matrix (32ch)
+            # TODO: implement upsampling from 4ch -> 32ch
+            vsg_sig, apgd, mapper = get_visibility_matrix(
                 eigen_sig,
                 sr,
                 apgd=True,
                 t_sti=t_sti,
-                scale="log",
-                nbands=16
+                scale="linear",
+                nbands=9
             )
 
-            # (nframes, nbands, nch, nch)
-            vg_labels.append(vsg_sig.transpose(1, 0, 2, 3))
-
-            # (nframes, nbands, Npx)
-            apgd_labels.append(apgd.transpose(1, 0, 2))
-
-            for _ in range(apgd.shape[1]):
-                t_sti_list.append(t_sti)
-
-        b_np = np.vstack(vg_labels)
-        c_np = np.vstack(apgd_labels)
-        d_np = np.vstack(t_sti_list)
-
-        print("shape of b_np", b_np.shape)
-        print("shape of c_np", c_np.shape)
-        print("shape of d_np", d_np.shape)
-
-        f.create_dataset("em32", shape=b_np.shape, dtype=b_np.dtype, data=b_np)
-        f.create_dataset("apgd", shape=c_np.shape, dtype=c_np.dtype, data=c_np)
-        f.create_dataset("dur", shape=d_np.shape, dtype=d_np.dtype, data=d_np)
-        f.attrs["sr"] = sr
+            generate_acoustic_map_video(
+                apgd_arr=apgd,
+                r=mapper,
+                # Need to map to milliseconds for mpl
+                ts=t_sti * 10000,
+                f_out=file_outpath
+            )
 
 
 if __name__ == "__main__":
