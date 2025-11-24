@@ -50,7 +50,7 @@ def main(outpath: str | Path) -> None:
             fig=fig_yolos,
             ax=ax_yolos,
             add_frame=True,
-            frame_cap=5
+            # frame_cap=5
         )
 
         # Annotate audio with APGD
@@ -62,7 +62,7 @@ def main(outpath: str | Path) -> None:
             t_sti=AUDIO_TS,
             scale="linear",
             nbands=9,
-            frame_cap=5
+            # frame_cap=5
         )
         fig_apgd, ax_apgd = plt.subplots(nrows=1, ncols=1, figsize=(DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT))
         apgd_anim = generate_acoustic_map_video(
@@ -83,7 +83,7 @@ def main(outpath: str | Path) -> None:
             fig=fig_gt,
             ax=ax_gt,
             add_frame=True,
-            frame_cap=5
+            # frame_cap=5
         )
 
         yolos_anim.save("yolos.mp4")
