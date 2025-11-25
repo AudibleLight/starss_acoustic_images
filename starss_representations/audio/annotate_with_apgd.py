@@ -166,6 +166,7 @@ def spherical_jn_series_threshold(x, table_lookup=True, epsilon=1e-2):
             if 1 - series(n_opt, x) < epsilon:
                 return n_opt
 
+
 def nyquist_rate(xyz, wl):
     """
     Order of imageable complex plane-waves by an instrument.
@@ -225,9 +226,7 @@ def steering_operator(xyz, r):
     """
     Steering matrix.
     """
-    freq, bw = (skutil  # Center frequencies to form images
-            .view_as_windows(np.linspace(1500, 4500, 10), (2,), 1)
-            .mean(axis=-1)), 50.0  # [Hz]
+    freq, bw = np.linspace(50, 4500, 9), 50.0  # [Hz]
     wl = constants.speed_of_sound / (freq.max() + 500)
     if wl <= 0:
         raise ValueError("Parameter[wl] must be positive.")
@@ -766,6 +765,10 @@ def draw_map(
     r_el_min, r_el_max = np.around([np.min(r_el), np.max(r_el)])
     r_az_min, r_az_max = np.around([np.min(r_az), np.max(r_az)])
 
+    # save original layout
+    orig_pos = ax.get_position()
+    orig_aspect = ax.get_aspect()
+
     # fig, ax = plt.subplots()
     bm = basemap.Basemap(
         projection='mill',
@@ -844,6 +847,17 @@ def draw_map(
         gmm = GaussianMixture(n_components=1, random_state=42)
         plot_gmm(gmm, x_y)
 
+    ax.tick_params(left=False, right=False, top=False, bottom=False)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for txt in ax.texts:
+        txt.set_visible(False)
+
+    # restore axis positions
+    ax.set_position(orig_pos)
+    ax.set(xticklabels=[], yticklabels=[])
+    ax.set_aspect(orig_aspect)
+
     return fig, ax, cluster_center
 
 
@@ -885,11 +899,7 @@ def get_visibility_matrix(
     print("[1/6] Computing frequency bands...")
     # Use spacing between 50 and 4500 Hz as in LAM paper
     if scale == "linear":
-        freq = (
-            skutil
-            .view_as_windows(np.linspace(50, 4500, nbands + 1), (2,), 1)
-            .mean(axis=-1)
-        )
+        freq = np.linspace(50, 4500, nbands)
         bw = 50.0
     elif scale == "log":
         freq = librosa.mel_frequencies(n_mels=nbands, fmin=50, fmax=4500)
@@ -918,7 +928,7 @@ def get_visibility_matrix(
 
     print("[5/6] Processing bands...")
     for i in range(nbands):
-        print(f"\n--- Band {i+1}/{nbands} | freq={freq[i]:.2f} Hz ---")
+        print(f"\n--- Band {i + 1}/{nbands} | freq={freq[i]:.2f} Hz ---")
 
         t_stationarity = 10 * t_sti
         print("    → Computing visibility matrices...")
@@ -941,7 +951,7 @@ def get_visibility_matrix(
         for s_idx in range(n_sample):
 
             if s_idx % 20 == 0 or s_idx == n_sample - 1:
-                print(f"        Frame {s_idx+1}/{n_sample}")
+                print(f"        Frame {s_idx + 1}/{n_sample}")
 
             # Eigen-decomposition
             s_d, s_v = linalg.eigh(s[s_idx])
@@ -982,16 +992,17 @@ def get_visibility_matrix(
 
 
 def generate_acoustic_map_video(
-    apgd_arr: np.ndarray,
-    r: np.ndarray,
-    ts: float,
-    f_out: str | Path = None,
-    fig: plt.Figure = None,
-    ax: plt.Figure = None
+        apgd_arr: np.ndarray,
+        r: np.ndarray,
+        ts: float,
+        f_out: str | Path = None,
+        fig: plt.Figure = None,
+        ax: plt.Figure = None
 ) -> FuncAnimation:
     """
     Generate acoustic map as video
     """
+
     def update(frame_idx: int) -> plt.Axes:
         # Clear the current canvas
         ax.clear()
@@ -1011,8 +1022,10 @@ def generate_acoustic_map_video(
         )
 
         # Set plot aesthetics
-        ax.set(xlim=xlim, xticks=[], yticks=[], title="Acoustic Map")
-        fig.tight_layout()
+        ax.set(xticks=[], yticks=[], title="Acoustic Map", xticklabels=[], yticklabels=[])
+        if frame_idx == 0:
+            ax.invert_xaxis()
+        fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.95)
 
         return ax
 
@@ -1031,9 +1044,6 @@ def generate_acoustic_map_video(
     # Create figure and axis if not already existing
     if fig is None or ax is None:
         fig, ax = plt.subplots(1, 1)
-
-    # Need an inverted x-axis
-    xlim = ax.get_xlim()[::-1]
 
     # Need to plot the first frame
     _ = update(0)
