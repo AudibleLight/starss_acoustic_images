@@ -7,7 +7,6 @@ Create the following (synchronised) videos:
 1) YOLOS bounding box annotations
 2) APGD acoustic map
 3) Ground truth metadata annotations
-4) Everything combined
 """
 
 import os
@@ -28,13 +27,37 @@ from starss_representations import utils
 DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT = 10, 5
 DEFAULT_OUTPATH = utils.get_project_root() / "outputs/combined"
 
-AUDIO_TS = utils.VIDEO_FRAME_TIME / 10
+# window length for processing audio
+DEFAULT_AUDIO_TS = utils.VIDEO_FRAME_TIME / 10
+DEFAULT_AUDIO_NBANDS = 9
+DEFAULT_AUDIO_SCALE = "linear"
+
+# maximum number of frames to process: set to -1 to use all frames
+DEFAULT_FRAME_CAP = -1
 
 
-def main(outpath: str | Path) -> None:
+def main(
+    outpath: str | Path,
+    audio_ts: float,
+    audio_nbands: int,
+    audio_scale: str,
+    frame_cap: int
+) -> None:
+    """
+    Compute all annotations for all videos.
+
+    The following videos are created and combined into a single, syncronised file:
+        1) YOLOS bounding box annotations
+        2) APGD acoustic map
+        3) Ground truth metadata annotations
+    """
     # Sanitise output directory
     outdir = Path(outpath)
     utils.create_output_dir_with_subdirs(outdir)
+
+    # Set frame cap to None if below 0
+    if frame_cap < 0:
+        frame_cap = None
 
     for f in utils.DESIRED_FILES:
         eigen_file = utils.EIGEN_PATH / (f + "_eigen.wav")
@@ -47,14 +70,17 @@ def main(outpath: str | Path) -> None:
 
         # Annotate video with YOLOS
         fig_yolos, ax_yolos = plt.subplots(nrows=1, ncols=1, figsize=(DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT))
-        yolos_orig, yolos_sanit = extract_bounding_boxes(video_file, frame_cap=5)
+        yolos_orig, yolos_sanit = extract_bounding_boxes(
+            video_file,
+            frame_cap=frame_cap
+        )
         yolos_anim = animate_bounding_boxes(
             video_file,
             yolos_sanit,
             fig=fig_yolos,
             ax=ax_yolos,
             add_frame=True,
-            # frame_cap=5
+            frame_cap=frame_cap
         )
 
         # Annotate audio with APGD
@@ -63,16 +89,16 @@ def main(outpath: str | Path) -> None:
             eigen_sig,
             sr,
             apgd=True,
-            t_sti=AUDIO_TS,
-            scale="linear",
-            nbands=9,
-            # frame_cap=5
+            t_sti=audio_ts,
+            scale=audio_scale,
+            nbands=audio_nbands,
+            frame_cap=frame_cap
         )
         fig_apgd, ax_apgd = plt.subplots(nrows=1, ncols=1, figsize=(DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT))
         apgd_anim = generate_acoustic_map_video(
             apgd_arr=apgd,
             r=mapper,
-            ts=AUDIO_TS * 10000,
+            ts=audio_ts * 10000,
             fig=fig_apgd,
             ax=ax_apgd
         )
@@ -86,7 +112,7 @@ def main(outpath: str | Path) -> None:
             fig=fig_gt,
             ax=ax_gt,
             add_frame=True,
-            # frame_cap=5
+            frame_cap=frame_cap
         )
 
         yolos_anim.save("yolos.mp4")
@@ -128,9 +154,11 @@ def main(outpath: str | Path) -> None:
 
             # Create attributes
             hdf.attrs["sr"] = sr
-            hdf.attrs["nbands"] = apgd.shape[0]
-            hdf.attrs["nframes_audio"] = apgd.shape[1]
-            hdf.attrs["npx"] = apgd.shape[2]
+            hdf.attrs["audio_nbands"] = apgd.shape[0]
+            hdf.attrs["audio_ts"] = audio_ts
+            hdf.attrs["audio_nframes"] = apgd.shape[1]
+            hdf.attrs["audio_npx"] = apgd.shape[2]
+            hdf.attrs["audio_scale"] = audio_scale
 
 
 if __name__ == "__main__":
@@ -141,6 +169,30 @@ if __name__ == "__main__":
         type=str,
         help="Path to the output HDF5 dataset",
         default=DEFAULT_OUTPATH
+    )
+    parser.add_argument(
+        "--audio-ts",
+        type=float,
+        help=f"Audio window length, defaults to {round(DEFAULT_AUDIO_TS)}",
+        default=DEFAULT_AUDIO_TS
+    )
+    parser.add_argument(
+        "--audio-nbands",
+        type=int,
+        help=f"Number of bands to use when processing audio, defaults to {DEFAULT_AUDIO_NBANDS}",
+        default=DEFAULT_AUDIO_NBANDS
+    )
+    parser.add_argument(
+        "--audio-scale",
+        type=int,
+        help=f"Frequency scale to use when processing audio, defaults to {DEFAULT_AUDIO_SCALE}",
+        default=DEFAULT_AUDIO_SCALE
+    )
+    parser.add_argument(
+        "--frame-cap",
+        type=int,
+        help=f"Maximum number of frames to process: set to -1 to process all frames",
+        default=-1
     )
 
     # Parse arguments
