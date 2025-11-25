@@ -80,7 +80,7 @@ def process_video(
     Process a video frame-by-frame with all annotations
     """
     def update_video(frame_idx: int):
-        if frame_idx % 100 == 0:
+        if frame_idx % 10 == 0:
             print(f"Processing ground truth, frame {frame_idx} / {n_frames if not frame_cap else frame_cap}...")
 
         # Clear the axis for the current frame

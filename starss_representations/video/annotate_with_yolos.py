@@ -340,6 +340,9 @@ def animate_bounding_boxes(
         fig, ax = plt.subplots(1, 1)
 
     def update_video(frame_idx: int):
+        if frame_idx % 10 == 0:
+            print(f"Annotating YOLOS, frame {frame_idx} / {n_frames if not frame_cap else frame_cap}...")
+
         ax.clear()
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
