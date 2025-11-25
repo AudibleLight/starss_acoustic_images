@@ -1014,7 +1014,7 @@ def generate_acoustic_map_video(
         draw_map(
             r=r,
             i=vs,
-            lon_ticks=np.linspace(-180, 180, 5),
+            lon_ticks=np.linspace(180, -180, 5),
             fig=fig,
             ax=ax,
             show_labels=False,
@@ -1023,8 +1023,8 @@ def generate_acoustic_map_video(
 
         # Set plot aesthetics
         ax.set(xticks=[], yticks=[], title="Acoustic Map", xticklabels=[], yticklabels=[])
-        if frame_idx == 0:
-            ax.invert_xaxis()
+        # if frame_idx == 0:
+        #     ax.invert_xaxis()
         fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.95)
 
         return ax
