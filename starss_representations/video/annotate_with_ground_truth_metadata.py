@@ -81,7 +81,7 @@ def process_video(
     """
     def update_video(frame_idx: int):
         if frame_idx % 100 == 0:
-            print(f"Frame {frame_idx} / {n_frames}...")
+            print(f"Processing ground truth, frame {frame_idx} / {n_frames if not frame_cap else frame_cap}...")
 
         # Clear the axis for the current frame
         ax.clear()
@@ -93,8 +93,14 @@ def process_video(
         if not ret:
             return ax
 
+        # Set plot aesthetics before doing anything else
+        ax.set(title="Ground Truth", xticks=[], yticks=[])
+        fig.tight_layout()
+
+        # Add the frame in
         if add_frame:
-            ax.imshow(frame)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            ax.imshow(rgb)
 
         if frame_idx not in annotations_map.keys():
             return ax

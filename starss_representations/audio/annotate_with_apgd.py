@@ -883,10 +883,11 @@ def get_visibility_matrix(
 
     # --- Frequency band creation ---
     print("[1/6] Computing frequency bands...")
+    # Use spacing between 50 and 4500 Hz as in LAM paper
     if scale == "linear":
         freq = (
             skutil
-            .view_as_windows(np.linspace(1500, 4500, nbands + 1), (2,), 1)
+            .view_as_windows(np.linspace(50, 4500, nbands + 1), (2,), 1)
             .mean(axis=-1)
         )
         bw = 50.0
@@ -991,37 +992,53 @@ def generate_acoustic_map_video(
     """
     Generate acoustic map as video
     """
-    def update(frame_idx):
+    def update(frame_idx: int) -> plt.Axes:
+        # Clear the current canvas
         ax.clear()
 
-        # prepare intensity map for this frame
-        vs__ = apgd_arr[:, frame_idx, :]  # (9, N_px)
-        apgd_map_vs__ = to_rgb(vs__)
-        apgd_map_vs__ /= apgd_map_vs__.max()
+        # Get the current frame from the normalised RGB array
+        vs = ip_norm[frame_idx, :, :]
 
-        # redraw frame
+        # Redraw frame
         draw_map(
             r=r,
-            i=apgd_map_vs__,
+            i=vs,
             lon_ticks=np.linspace(-180, 180, 5),
             fig=fig,
             ax=ax,
-            show_labels=True,
+            show_labels=False,
             show_axis=True
         )
 
-        # ax.set_title(f"Frame {frame_idx}")
+        # Set plot aesthetics
+        ax.set(xlim=xlim, xticks=[], yticks=[], title="Acoustic Map")
+        fig.tight_layout()
 
         return ax
+
+    # Convert intensity map to RGB
+    ip = np.zeros((apgd_arr.shape[1], 3, apgd_arr.shape[-1]))
+    for fi in range(apgd_arr.shape[1]):
+        vs__ = apgd_arr[:, fi, :]
+        map_vs__ = to_rgb(vs__)
+        ip[fi, :, :] = map_vs__
+
+    # Normalise the APGD map globally
+    # Shape (n_frames, 3, n_px)
+    ip_norm = ip.copy()
+    ip_norm /= ip_norm.max()
 
     # Create figure and axis if not already existing
     if fig is None or ax is None:
         fig, ax = plt.subplots(1, 1)
 
+    # Need an inverted x-axis
+    xlim = ax.get_xlim()[::-1]
+
     # Need to plot the first frame
     _ = update(0)
 
-    # Create the animation
+    # Create the animation and save if required
     anim = FuncAnimation(
         fig,
         update,

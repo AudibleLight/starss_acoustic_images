@@ -286,7 +286,7 @@ def process_video(
         Update the animation at the current index
         """
         if frame_idx % 10 == 0:
-            print(f"Frame {frame_idx} / {n_frames}...")
+            print(f"Processing YOLOS, frame {frame_idx} / {n_frames if not frame_cap else frame_cap}...")
 
         # Clear the axis for the current frame
         ax.clear()
@@ -295,13 +295,18 @@ def process_video(
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
 
+        # Set aesthetics
+        ax.set(xticks=[], yticks=[], title="YOLOS Bounding Boxes")
+        fig.tight_layout()
+
         # Break once out of frames
         if not ret:
             return ax
 
         # Set the current image
         if add_frame:
-            ax.imshow(frame)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            ax.imshow(rgb)
 
         frame_bboxes = []
 
