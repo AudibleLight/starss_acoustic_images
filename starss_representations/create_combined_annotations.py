@@ -184,7 +184,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--audio-scale",
-        type=int,
+        type=str,
         help=f"Frequency scale to use when processing audio, defaults to {DEFAULT_AUDIO_SCALE}",
         default=DEFAULT_AUDIO_SCALE
     )
