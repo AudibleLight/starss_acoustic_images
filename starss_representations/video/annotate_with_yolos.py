@@ -262,137 +262,127 @@ def sanitise_bboxes(bboxes: np.ndarray) -> np.ndarray:
     Sanitise bounding boxes, removing those with invalid values
     """
     bboxes = np.array(bboxes)
-    mask_x = (bboxes[:, 2] - bboxes[:, 0]) > 0
-    mask_y = (bboxes[:, 3] - bboxes[:, 1]) > 0
+    mask_x = (bboxes[:, 3] - bboxes[:, 1]) > 0
+    mask_y = (bboxes[:, 4] - bboxes[:, 2]) > 0
     mask_cls = np.isin(bboxes[:, -1].astype(int), np.array(desired_ids))
     mask = np.logical_and.reduce((mask_x, mask_y, mask_cls))
     return bboxes[mask]
 
 
-def process_video(
+def extract_bounding_boxes(
     input_file: str | Path,
-    output_file: str | Path = None,
-    fig: plt.Figure = None,
-    ax: plt.Axes = None,
-    add_frame: bool = True,
-    frame_cap: int = None,
-) -> FuncAnimation:
+    frame_cap: int = None
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Process video and save animation if required
+    Extract bounding boxes from a video and return raw and sanitized arrays.
     """
+    global_bboxes, global_bboxes_sanitised = [], []
 
-    def update_video(frame_idx: int) -> plt.Axes:
-        """
-        Update the animation at the current index
-        """
+    cap = cv2.VideoCapture(str(input_file))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file {input_file}")
+
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    trans = [equirectangular_to_perspective(FOV, x, y) for (x, y) in VIEWS]
+
+    for frame_idx in range(n_frames if not frame_cap else frame_cap):
         if frame_idx % 10 == 0:
             print(f"Processing YOLOS, frame {frame_idx} / {n_frames if not frame_cap else frame_cap}...")
 
-        # Clear the axis for the current frame
-        ax.clear()
-
-        # Get the current frame
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
-
-        # Set aesthetics
-        ax.set(xticks=[], yticks=[], title="YOLOS Bounding Boxes")
-        fig.tight_layout()
-
-        # Break once out of frames
         if not ret:
-            return ax
-
-        # Set the current image
-        if add_frame:
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            ax.imshow(rgb)
+            break
 
         frame_bboxes = []
 
         all_persp = np.zeros((len(trans), OUT_WIDTH, OUT_HEIGHT, 3))
         for idx, (trans_x, trans_y) in enumerate(trans):
-            # Compute perspective view at current translation
-            persp = cv2.remap(
-                frame,
-                trans_x,
-                trans_y,
-                cv2.INTER_CUBIC,
-                borderMode=cv2.BORDER_WRAP
-            )
-            all_persp[idx, :, :, :] = persp
+            persp = cv2.remap(frame, trans_x, trans_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
+            all_persp[idx] = persp
 
-        # Detect objects for current perspective
-        #  Boxes have the format (xmin, ymin, xmax, ymax, class)
         bboxes_persp = compute_bounding_boxes(all_persp)
 
-        # Map bounding boxes back to equirectangular format with the transforms
         for bb, (trans_x, trans_y) in zip(bboxes_persp, trans):
-            frame_bboxes.extend([perspective_bbox_to_equirectangular(b, trans_x, trans_y) for b in bb])
+            frame_bboxes.extend([(frame_idx, *perspective_bbox_to_equirectangular(b, trans_x, trans_y)) for b in bb])
 
-        # Skip over if no bounding boxes for this frame
-        if len(frame_bboxes) == 0:
-            return ax
-
-        # Remove overlapping bboxes and those with invalid values
+        # frame_idx, xmin, ymin, xmax, ymax, class
+        #  dimensions are in EQUIRECTANGULAR form now
         valid_bboxes = sanitise_bboxes(frame_bboxes)
 
-        # Add all the bounding boxes in
-        for (xmin, ymin, xmax, ymax, cls) in valid_bboxes:
-            rect = mpatches.Rectangle(
-                (xmin, ymin),
-                xmax - xmin,
-                ymax - ymin,
-                facecolor="none",
-                edgecolor="red",
-                linewidth=2,
-                zorder=10000
-            )
-            cls_label = model.config.id2label[cls]
-            ax.text(
-                xmax + 10,
-                ymax + 10,
-                cls_label,
-                bbox=dict(facecolor='red', zorder=10000)
-            )
-            ax.add_patch(rect)
+        global_bboxes.append(np.array(frame_bboxes))
+        global_bboxes_sanitised.append(valid_bboxes)
 
-        # Close everything after reaching the last frame
-        if frame_idx == n_frames - 1:
-            cap.release()
-
-        return ax
+    cap.release()
+    return np.vstack(global_bboxes), np.vstack(global_bboxes_sanitised)
 
 
-    # Create the figure + axis if not provided
-    if fig is None or ax is None:
-        fig, ax = plt.subplots(1, 1)
-
-    # Open the input video file for reading frames
+def animate_bounding_boxes(
+    input_file: str | Path,
+    bboxes_sanitised: np.ndarray,
+    output_file: str | Path = None,
+    fig: plt.Figure = None,
+    ax: plt.Axes = None,
+    add_frame: bool = True,
+    frame_cap: int = None
+) -> FuncAnimation:
+    """
+    Annotate a video with bounding boxes and create/save an animation.
+    """
     cap = cv2.VideoCapture(str(input_file))
     if not cap.isOpened():
         raise ValueError(f"Could not open video file {input_file}")
 
-    # Compute frame count
     n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frames_to_use = n_frames if frame_cap is None else frame_cap
 
-    # Compute transforms for every desired view
-    trans = [equirectangular_to_perspective(FOV, x, y) for (x, y) in VIEWS]
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(1, 1)
 
-    # Create the animation
+    def update_video(frame_idx: int):
+        ax.clear()
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            return ax
+
+        ax.set(xticks=[], yticks=[], title="YOLOS Bounding Boxes")
+        fig.tight_layout()
+
+        if add_frame:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            ax.imshow(rgb)
+
+        # get bounding boxes for current frame idx
+        bboxes_at_frame = bboxes_sanitised[np.argwhere(bboxes_sanitised[:, 0] == frame_idx).flatten(), :]
+
+        for (frm, xmin, ymin, xmax, ymax, cls) in bboxes_at_frame:
+            assert frm == frame_idx
+
+            rect = mpatches.Rectangle(
+                (xmin, ymin), xmax - xmin, ymax - ymin,
+                facecolor="none", edgecolor="red", linewidth=2, zorder=10000
+            )
+            cls_label = model.config.id2label[cls]
+            ax.text(xmax + 10, ymax + 10, cls_label, bbox=dict(facecolor='red', zorder=10000))
+            ax.add_patch(rect)
+
+        if frame_idx == frames_to_use - 1:
+            cap.release()
+
+        return ax
+
     fa = FuncAnimation(
         fig,
         update_video,
-        frames=n_frames if not frame_cap else frame_cap,
+        frames=frames_to_use,
         repeat=False,
-        # interval needs to be provided in milliseconds
         interval=utils.VIDEO_FRAME_TIME * 1000
     )
-    # Save the animation
+
     if output_file is not None:
         fa.save(output_file)
 
-    # Return the animation
     return fa
 
 
@@ -409,7 +399,8 @@ def main(input_files: list[str], output_dir: str):
         #     continue
 
         input_file = utils.VIDEO_PATH / f"{fi}.mp4"
-        process_video(input_file, output_file)
+        bbox_orig, bbox_sanit = extract_bounding_boxes(input_file)
+        animate_bounding_boxes(input_file, bbox_sanit, output_file)
 
 
 if __name__ == "__main__":
