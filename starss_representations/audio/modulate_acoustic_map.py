@@ -133,7 +133,7 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
         fig,
         update,
         frames=frame_cap if frame_cap > 0 else frame_count,
-        interval=utils.VIDEO_FRAME_TIME,
+        interval=utils.VIDEO_FRAME_TIME * 1000,
         repeat=False
     )
     anim.save(out_file, dpi=DEFAULT_DPI)
