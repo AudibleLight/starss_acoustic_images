@@ -5,7 +5,6 @@
 Overlay acoustic map vs ground truth annotations
 """
 
-
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -26,7 +25,7 @@ MASK_RADIUS = 30
 
 # maximum number of frames to process: set to -1 to use all frames
 DEFAULT_FRAME_CAP = 30
-DEFAULT_DPI = 1000
+DEFAULT_DPI = 200
 
 
 def read_from_hdf(hdf_file: File, dataset_name: str) -> np.ndarray:
@@ -157,7 +156,7 @@ if __name__ == "__main__":
         "--out-file",
         type=str,
         help="Path to save output",
-        default=str(DEFAULT_IN_FILE.with_suffix(".mp4"))
+        default=str(DEFAULT_IN_FILE.with_suffix("_modulated.mp4"))
     )
     parser.add_argument(
         "--frame-cap",
