@@ -156,7 +156,7 @@ if __name__ == "__main__":
         "--out-file",
         type=str,
         help="Path to save output",
-        default=str(DEFAULT_IN_FILE.with_suffix("_modulated.mp4"))
+        default=str(DEFAULT_IN_FILE.parent / str(DEFAULT_IN_FILE.name).replace(".hdf", "_modulated.mp4"))
     )
     parser.add_argument(
         "--frame-cap",
