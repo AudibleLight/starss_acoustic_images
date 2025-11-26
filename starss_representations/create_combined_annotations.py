@@ -24,7 +24,6 @@ from starss_representations.video.annotate_with_ground_truth_metadata import pro
 from starss_representations.audio.annotate_with_apgd import generate_acoustic_map_video, get_visibility_matrix
 from starss_representations import utils
 
-DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT = 10, 5
 DEFAULT_OUTPATH = utils.get_project_root() / "outputs/combined"
 
 # window length for processing audio
@@ -69,7 +68,7 @@ def main(
             assert fi.exists(), f"File {fi} does not exist!"
 
         # Annotate video with YOLOS
-        fig_yolos, ax_yolos = plt.subplots(nrows=1, ncols=1, figsize=(DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT))
+        fig_yolos, ax_yolos = plt.subplots(nrows=1, ncols=1, figsize=(utils.DEFAULT_FIG_WIDTH, utils.DEFAULT_FIG_HEIGHT))
         yolos_orig, yolos_sanit = extract_bounding_boxes(
             video_file,
             frame_cap=frame_cap
@@ -94,7 +93,7 @@ def main(
             nbands=audio_nbands,
             frame_cap=frame_cap
         )
-        fig_apgd, ax_apgd = plt.subplots(nrows=1, ncols=1, figsize=(DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT))
+        fig_apgd, ax_apgd = plt.subplots(nrows=1, ncols=1, figsize=(utils.DEFAULT_FIG_WIDTH, utils.DEFAULT_FIG_HEIGHT))
         apgd_anim = generate_acoustic_map_video(
             apgd_arr=apgd,
             r=mapper,
@@ -104,7 +103,7 @@ def main(
         )
 
         # Annotate with ground truth
-        fig_gt, ax_gt = plt.subplots(nrows=1, ncols=1, figsize=(DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT))
+        fig_gt, ax_gt = plt.subplots(nrows=1, ncols=1, figsize=(utils.DEFAULT_FIG_WIDTH, utils.DEFAULT_FIG_HEIGHT))
         annotations_map = create_annotations_map(meta_file)
         gt_anim = ground_truth_annotate(
             input_file=video_file,
@@ -192,7 +191,7 @@ if __name__ == "__main__":
         "--frame-cap",
         type=int,
         help=f"Maximum number of frames to process: set to -1 to process all frames",
-        default=-1
+        default=DEFAULT_FRAME_CAP
     )
 
     # Parse arguments

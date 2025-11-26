@@ -15,6 +15,9 @@ VIDEO_RES = (1920, 960)
 VIDEO_WIDTH, VIDEO_HEIGHT = VIDEO_RES
 VIDEO_RES_RESIZED = (960, 480)
 
+# Parameters for matplotlib figures
+DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT = 10, 5
+
 # Color measured in integers from 0 - 255
 MIN_COLOR, MAX_COLOR = 0, 255
 
