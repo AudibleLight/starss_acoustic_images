@@ -754,22 +754,28 @@ def draw_map(
         fig: plt.Figure = None,
         ax: plt.Axes = None,
         kmeans: bool = False,
-        gaussian_mixture: bool = False
+        gaussian_mixture: bool = False,
+        az0: list[float] | float = None,
+        el0: list[float] | float = None,
+        mask_radius: float = 30,
+        alpha: float = 0.9
 ) -> tuple:
+
     """
-    Draw acoustic map.
+    Draw acoustic map with optional angular masking.
     """
 
+    # Convert coordinate grid to elevation/azimuth (already spherical)
     _, r_el, r_az = cart2eq(*r)
     r_el, r_az = wrapped_rad2deg(r_el, r_az)
     r_el_min, r_el_max = np.around([np.min(r_el), np.max(r_el)])
     r_az_min, r_az_max = np.around([np.min(r_az), np.max(r_az)])
 
-    # save original layout
+    # Save original layout
     orig_pos = ax.get_position()
     orig_aspect = ax.get_aspect()
 
-    # fig, ax = plt.subplots()
+    # Basemap init
     bm = basemap.Basemap(
         projection='mill',
         llcrnrlat=r_el_min,
@@ -782,49 +788,86 @@ def draw_map(
 
     if show_axis:
         bm_labels = [1, 0, 0, 1]
-    else:
-        bm_labels = [0, 0, 0, 0]
-    bm.drawparallels(
-        np.linspace(r_el_min, r_el_max, 5),
-        color='w',
-        dashes=[1, 0],
-        labels=bm_labels,
-        labelstyle='+/-',
-        textcolor='#565656',
-        zorder=0,
-        linewidth=2
-    )
-    bm.drawmeridians(
-        lon_ticks,
-        color='w',
-        dashes=[1, 0],
-        labels=bm_labels,
-        labelstyle='+/-',
-        textcolor='#565656',
-        zorder=0,
-        linewidth=2
-    )
+        bm.drawparallels(
+            np.linspace(r_el_min, r_el_max, 5),
+            color='w',
+            dashes=[1, 0],
+            labels=bm_labels,
+            labelstyle='+/-',
+            textcolor='#565656',
+            zorder=0,
+            linewidth=2
+        )
+        bm.drawmeridians(
+            lon_ticks,
+            color='w',
+            dashes=[1, 0],
+            labels=bm_labels,
+            labelstyle='+/-',
+            textcolor='#565656',
+            zorder=0,
+            linewidth=2
+        )
 
     if show_labels:
         ax.set_xlabel('Azimuth (degrees)', labelpad=20)
         ax.set_ylabel('Elevation (degrees)', labelpad=40)
 
+    # Project spherical to 2D basemap coordinates
     r_x, r_y = bm(r_az, r_el)
+
+    # optional masking
+    if az0 is not None and el0 is not None:
+        if isinstance(az0, float):
+            az0 = np.ndarray([az0])
+        if isinstance(el0, float):
+            el0 = np.ndarray([el0])
+
+        # Convert to radians
+        az1 = np.deg2rad(r_az)
+        el1 = np.deg2rad(r_el)
+        az0r = np.deg2rad(az0)
+        el0r = np.deg2rad(el0)
+
+        # Spherical angular distance
+        ang = np.arccos(
+            np.sin(el0r[:, None]) * np.sin(el1[None, :]) +
+            np.cos(el0r[:, None]) * np.cos(el1[None, :]) * np.cos(az1[None, :] - az0r[:, None])
+        )
+        ang_deg = np.rad2deg(ang)
+
+        # compute mask, use logical OR across rows
+        mask = (ang_deg <= mask_radius).any(axis=0)
+
+        # apply mask
+        i[:, ~mask] = 0
+
+    # triangulation + plotting
     triangulation = tri.Triangulation(r_x, r_y)
 
     n_px = i.shape[1]
     mycmap = cmap_from_list('mycmap', i.T, n=n_px)
     colors_cmap = np.arange(n_px)
+
     ax.tripcolor(
         triangulation,
         colors_cmap,
         cmap=mycmap,
-        shading='gouraud',
-        alpha=0.9,
-        edgecolors='w',
-        linewidth=0.1
+        shading='gouraud',  # removes interpolation patterns
+        edgecolors='none',
+        linewidth=0,
+        alpha=alpha,
+        zorder=100,
     )
 
+    # annotate the target point (always)
+    if az0 is not None and el0 is not None:
+        for az0_, el0_ in zip(az0, el0):
+            px, py = bm(az0_, el0_)
+            ax.plot(px, py, 'ro', markersize=10, zorder=1000)
+            ax.text(px, py, f" ({az0_}°, {el0_}°)", color="red", fontsize=9, zorder=1000)
+
+    # clustering with kmeans/GMM if required
     cluster_center = None
     if kmeans:
         npts = 18  # find N maximum points
@@ -838,7 +881,6 @@ def draw_map(
         ax.scatter(clusters[:, 0], clusters[:, 1], s=500, alpha=0.3)  # plot the center as a large point
         cluster_center = bm(clusters[:, 0][0], clusters[:, 1][0], inverse=True)
 
-    # compute Gaussian Mixture model
     elif gaussian_mixture:
         npts = 18
         i_s = np.square(i).sum(axis=0)
@@ -847,6 +889,7 @@ def draw_map(
         gmm = GaussianMixture(n_components=1, random_state=42)
         plot_gmm(gmm, x_y)
 
+    # cosmetic cleanup
     ax.tick_params(left=False, right=False, top=False, bottom=False)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -991,6 +1034,31 @@ def get_visibility_matrix(
     return vis_arr, apgd_arr, r
 
 
+def acoustic_map_to_rgb(apgd_arr: np.ndarray, normalize: bool = True, scaling: float = None) -> np.ndarray:
+    """
+    Convert intensity map with shape (n_bands, n_frames, n_px) to shape (3, n_frames)
+
+    If normalise, scale so that maximum intensity across all frames == 1
+    If scaling, multiply all values by a constant then clip to within original range
+    """
+    ip = np.zeros((apgd_arr.shape[1], 3, apgd_arr.shape[-1]))
+    for fi in range(apgd_arr.shape[1]):
+        vs__ = apgd_arr[:, fi, :]
+        map_vs__ = to_rgb(vs__)
+        ip[fi, :, :] = map_vs__
+
+    # Normalize or not
+    if normalize:
+        ip /= ip.max()
+
+    # Scale by a floating point value then clip to avoid overflow
+    if scaling:
+        orig_min, orig_max = ip.min(), ip.max()
+        ip *= scaling
+        ip = np.clip(ip, orig_min, orig_max)
+
+    return ip
+
 def generate_acoustic_map_video(
         apgd_arr: np.ndarray,
         r: np.ndarray,
@@ -1029,16 +1097,7 @@ def generate_acoustic_map_video(
         return ax
 
     # Convert intensity map to RGB
-    ip = np.zeros((apgd_arr.shape[1], 3, apgd_arr.shape[-1]))
-    for fi in range(apgd_arr.shape[1]):
-        vs__ = apgd_arr[:, fi, :]
-        map_vs__ = to_rgb(vs__)
-        ip[fi, :, :] = map_vs__
-
-    # Normalise the APGD map globally
-    # Shape (n_frames, 3, n_px)
-    ip_norm = ip.copy()
-    ip_norm /= ip_norm.max()
+    ip_norm = acoustic_map_to_rgb(apgd_arr, normalize=True)
 
     # Create figure and axis if not already existing
     if fig is None or ax is None:
@@ -1107,7 +1166,7 @@ def main(data_src: str, outpath: str) -> None:
 
 if __name__ == "__main__":
     # Set up argument parser
-    parser = ArgumentParser(description="Generate HDF5 dataset for LAM training.")
+    parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--data-src",
         type=str,
