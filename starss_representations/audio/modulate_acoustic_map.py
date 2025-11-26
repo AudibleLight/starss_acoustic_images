@@ -49,7 +49,7 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
 
     def update(frame_idx: int) -> plt.Axes:
         if frame_idx % 10 == 0:
-            print(f"Processing frame {frame_idx} / {frame_count}")
+            print(f"Processing frame {frame_idx} / {frame_count if frame_cap == -1 else frame_cap}")
 
         ax.clear()
 
@@ -140,8 +140,8 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
     anim.save(out_file, dpi=DEFAULT_DPI)
 
 
-def main(in_file: str | Path, out_file: str | Path, frame_cap: int) -> None:
-    process_video(in_file, out_file, frame_cap)
+def main(input_file: str | Path, out_file: str | Path, frame_cap: int) -> None:
+    process_video(Path(input_file), Path(out_file), frame_cap)
 
 
 if __name__ == "__main__":
@@ -154,7 +154,7 @@ if __name__ == "__main__":
         default=str(DEFAULT_IN_FILE)
     )
     parser.add_argument(
-        "--outpath",
+        "--out-file",
         type=str,
         help="Path to save output",
         default=str(DEFAULT_IN_FILE.with_suffix(".mp4"))
