@@ -11,12 +11,13 @@ from pathlib import Path
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+import librosa
 from h5py import File
 from matplotlib.animation import FuncAnimation
+from scipy.io import wavfile
 
 from starss_representations import utils
 from starss_representations.audio.annotate_with_apgd import acoustic_map_to_rgb, draw_map
-
 
 DEFAULT_IN_FILE = utils.get_project_root() / "outputs/combined/dev-train-tau/fold3_room14_mix003.hdf"
 
@@ -25,7 +26,7 @@ MASK_RADIUS = 30
 
 # maximum number of frames to process: set to -1 to use all frames
 DEFAULT_FRAME_CAP = 30
-DEFAULT_DPI = 200
+DEFAULT_DPI = 400
 
 
 def read_from_hdf(hdf_file: File, dataset_name: str) -> np.ndarray:
@@ -36,7 +37,7 @@ def read_from_hdf(hdf_file: File, dataset_name: str) -> np.ndarray:
     retrieved = hdf_file[dataset_name]
     # Initialise an empty array and fill with the values from the dataset
     #  Note that this assumes the dataset is small enough to fit in memory ;)
-    filled = np.zeros(retrieved.shape)
+    filled = np.empty(retrieved.shape)
     retrieved.read_direct(filled)
     return filled
 
@@ -59,10 +60,13 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
         if not ret:
             return ax
 
+        # Need to flip the frame so that it matches the acoustic image
+        frame = cv2.flip(frame, 1)
+
         # Show the frame
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         ax.imshow(
-            rgb,
+            cv2.flip(rgb, 1),
             extent=(0, 1, 0, 1),
             transform=ax.transAxes,
             zorder=0,
@@ -103,6 +107,9 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
             mask_radius=MASK_RADIUS,
         )
 
+        # Flip the x-axis so the acoustic image looks correct
+        ax.invert_xaxis()
+
         return ax
 
     with File(in_file, "r") as hdf:
@@ -112,6 +119,20 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
         annotations = read_from_hdf(hdf, "annotations")
         # (3, n_px)
         r = read_from_hdf(hdf, "field")
+        # Get samplerate directly from the HDF file
+        sr = hdf.attrs.get("sr")
+
+    # Read eigenmike signal and convert to mono
+    #  this is just for the reference audio played against the video
+    eigen_path = utils.EIGEN_PATH / in_file.parent.name / in_file.name.replace(".hdf", "_eigen.wav")
+    em32_out, _ = librosa.load(str(eigen_path), sr=sr, mono=True)
+
+    # Truncate audio approximately according to frame cap
+    if frame_cap != -1:
+        em32_out = em32_out[:round(sr * (frame_cap * utils.VIDEO_FPS))]
+
+    # Save audio to a temporary directory. Needed to mux later with FFmpeg
+    wavfile.write("tmp.wav", sr, em32_out)
 
     # Convert the acoustic map to RGB and normalize so that max == 1
     #  this flattens to (n_frame, 3, n_px)
@@ -128,7 +149,7 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
     # Create evenly spaced longitudinal ticks
     lon_ticks = np.linspace(-180, 180, 5)
 
-    # Create the animation and save if required
+    # Create the animation and save to a temporary file
     anim = FuncAnimation(
         fig,
         update,
@@ -136,7 +157,12 @@ def process_video(in_file: str | Path, out_file: str | Path, frame_cap) -> None:
         interval=utils.VIDEO_FRAME_TIME * 1000,
         repeat=False
     )
-    anim.save(out_file, dpi=DEFAULT_DPI)
+    anim.save("tmp.mp4", dpi=DEFAULT_DPI)
+
+    # Finally, combine both the animation and the wavfile together and remove the temporary files
+    utils.combine_audio_and_video(
+        "tmp.mp4", "tmp.wav", str(out_file), cleanup_video=True, cleanup_audio=True
+    )
 
 
 def main(input_file: str | Path, out_file: str | Path, frame_cap: int) -> None:

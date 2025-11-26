@@ -219,7 +219,7 @@ def interp2d(array: np.ndarray, n_out: int) -> np.ndarray:
     return np.column_stack(ins)
 
 
-def combine_audio_and_video(video_path: str, audio_path: str, output_path: str, cleanup: bool = True) -> None:
+def combine_audio_and_video(video_path: str, audio_path: str, output_path: str, cleanup_video: bool = True, cleanup_audio: bool = False) -> None:
     """
     Use ffmpeg to combine the temporary annotated video with its original audio track
     """
@@ -237,8 +237,10 @@ def combine_audio_and_video(video_path: str, audio_path: str, output_path: str, 
         raise ValueError(f"Returned non-zero exit code from FFmpeg with command {ffmpeg_command}")
 
     # If cleaning up, remove original (temporary) video path
-    if cleanup:
+    if cleanup_video:
         os.remove(video_path)
+    if cleanup_audio:
+        os.remove(audio_path)
 
 
 def create_output_dir_with_subdirs(output_dir: str | Path, subdirs: list[str] = None) -> None:
