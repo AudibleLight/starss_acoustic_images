@@ -2,7 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-Create acoustic map using APGD for an audio file
+Create acoustic map using APGD for an audio file.
+
+We generate a .hdf file for every .wav file, using
+
+By default, we use logarithmic spacing for frequency bands ranging from 50Hz to 4500Hz, with a total of 16 bands. We
+use a timescale of 100 ms to match the labelling resolution of the DCASE files.
 """
 
 import math
@@ -34,9 +39,9 @@ from tqdm import tqdm
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from matplotlib.animation import FuncAnimation
+from h5py import File
 
 from starss_representations import utils
-
 
 EIGENMIKE_COORDS = {
     "1": [69, 0, 0.042],
@@ -73,7 +78,7 @@ EIGENMIKE_COORDS = {
     "32": [159, 271, 0.042],
 }
 DEFAULT_EIGEN_DIRECTORY = utils.get_project_root() / "data/eigen_dev"
-DEFAULT_OUTPATH = utils.get_project_root() / "outputs/eigen_dev_apgd_map"
+DEFAULT_OUTPATH = utils.get_project_root() / "outputs/apgd_dev"
 
 
 def _deg2rad(coords_dict):
@@ -106,7 +111,7 @@ def _polar2cart(coords_dict, units=None):
 
 
 def eq2cart(r, lat, lon):
-    r = np.array([r]) #if chk.is_scalar(r) else np.array(r, copy=False)
+    r = np.array([r])  # if chk.is_scalar(r) else np.array(r, copy=False)
     if np.any(r < 0):
         raise ValueError("Parameter[r] must be non-negative.")
 
@@ -262,8 +267,8 @@ def extract_visibilities(_data, _rate, t, fc, bw, alpha):
     # Don't understand yet why conj() on first term?
     # collapsed_spectrum = collapsed_spectrum[0,:]
     return (
-        collapsed_spectrum.reshape(n_stf, -1, 1).conj() *
-        collapsed_spectrum.reshape(n_stf, 1, -1)
+            collapsed_spectrum.reshape(n_stf, -1, 1).conj() *
+            collapsed_spectrum.reshape(n_stf, 1, -1)
     )
 
 
@@ -504,7 +509,7 @@ def _solve(functions, x0, solver=None, atol=None, dtol=None, rtol=1e-3, xtol=Non
             if relative < rtol and not rtol_only_zeros:
                 crit = 'RTOL'
         if xtol is not None:
-            err = np.linalg.norm(solver.sol - last_sol)    # noqa
+            err = np.linalg.norm(solver.sol - last_sol)  # noqa
             err /= np.sqrt(last_sol.size)
             if err < xtol:
                 crit = 'XTOL'
@@ -520,7 +525,7 @@ def _solve(functions, x0, solver=None, atol=None, dtol=None, rtol=1e-3, xtol=Non
 
     if verbosity in ['LOW', 'HIGH', 'ALL']:
         print('Solution found after {} iterations:'.format(niter))
-        print('    objective function f(sol) = {:e}'.format(current))    # noqa
+        print('    objective function f(sol) = {:e}'.format(current))  # noqa
         print('    stopping criterion: {}'.format(crit))
 
     # Returned dictionary.
@@ -676,9 +681,9 @@ def cmap_from_list(name: list, colors: list, n: int = 256, gamma: float = 1.0):
 
     # List of value, color pairs
     if (
-        isinstance(colors[0], Sized) and
-        (len(colors[0]) == 2) and
-        (not isinstance(colors[0], str))
+            isinstance(colors[0], Sized) and
+            (len(colors[0]) == 2) and
+            (not isinstance(colors[0], str))
     ):
         vals, colors = zip(*colors)
     else:
@@ -712,7 +717,7 @@ def draw_ellipse(position, covariance, ax=None, **kwargs):
 
     # Draw the Ellipse
     for nsig in range(1, 4):
-        ell =  mpatches.Ellipse(
+        ell = mpatches.Ellipse(
             position,
             nsig * width,
             nsig * height,
@@ -733,7 +738,7 @@ def plot_gmm(
     Plot gaussian mixture model
     """
     ax = ax or plt.gca()
-    labels = gmm.fit(x).predict(x)    # noqa
+    labels = gmm.fit(x).predict(x)  # noqa
     if label:
         ax.scatter(x[:, 0], x[:, 1], c=labels, s=40, cmap='viridis', zorder=2)
     else:
@@ -760,7 +765,6 @@ def draw_map(
         mask_radius: float = 30,
         alpha: float = 0.9
 ) -> tuple:
-
     """
     Draw acoustic map with optional angular masking.
     """
@@ -876,7 +880,7 @@ def draw_map(
         x_y = np.column_stack((r_x[max_idx], r_y[max_idx]))  # stack N max energy points
         km_res = KMeans(n_clusters=3).fit(x_y)  # apply k-means to max points
         # get center of the cluster of N points
-        clusters = km_res.cluster_centers_    # noqa
+        clusters = km_res.cluster_centers_  # noqa
         ax.scatter(r_x[max_idx], r_y[max_idx], c='b', s=5)  # plot all N points
         ax.scatter(clusters[:, 0], clusters[:, 1], s=500, alpha=0.3)  # plot the center as a large point
         cluster_center = bm(clusters[:, 0][0], clusters[:, 1][0], inverse=True)
@@ -920,13 +924,13 @@ def to_rgb(i: np.ndarray) -> np.ndarray:
 
 
 def get_visibility_matrix(
-    audio_in: np.ndarray,
-    fs: int,
-    apgd: bool = False,
-    t_sti: float = 10e-3,
-    scale: str = "linear",
-    nbands: int = 9,
-    frame_cap: int = None
+        audio_in: np.ndarray,
+        fs: int,
+        apgd: bool = False,
+        t_sti: float = 10e-3,
+        scale: str = "linear",
+        nbands: int = 9,
+        frame_cap: int = None
 ) -> tuple:
     """
     Compute visibility matrix from audio data.
@@ -1059,6 +1063,7 @@ def acoustic_map_to_rgb(apgd_arr: np.ndarray, normalize: bool = True, scaling: f
 
     return ip
 
+
 def generate_acoustic_map_video(
         apgd_arr: np.ndarray,
         r: np.ndarray,
@@ -1120,7 +1125,8 @@ def generate_acoustic_map_video(
     return anim
 
 
-def main(data_src: str, outpath: str) -> None:
+# why does t_sti need to be 0.01 for 100 ms resolution? Shouldn't it be 0.1?
+def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
     eigenmike_files = [p for p in Path(data_src).rglob("**/*.wav") if "._" not in str(p)]
 
     # Sanitise output directory
@@ -1128,40 +1134,42 @@ def main(data_src: str, outpath: str) -> None:
     if not outdir.exists():
         outdir.mkdir(parents=True)
 
-    # logarithmically space duration from 2sec to 10ms, rounded to 3 dp
-    t_logs_spaced = np.logspace(np.log10(1e-3), np.log10(0.2), 9)
-    t_logs_spaced = np.round(t_logs_spaced, 3)[::-1]
-
     # Iterate over every audio file
     for clip_name in tqdm(eigenmike_files, desc="Processing files..."):
+
+        apgd_labels = []
 
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
 
-        # Iterate over every timescale
-        for t_sti in t_logs_spaced:
+        # Create folder for split if required
+        file_split = clip_name.parent.stem
+        outpath_with_split = outdir / file_split
+        if not outpath_with_split.exists():
+            outpath_with_split.mkdir(parents=True)
 
-            # Set filepath for this timescale + clip
-            file_outpath = f"{outdir}/{str(clip_name).split('/')[-1].split('.')[0]}_{round(t_sti * 10000)}ms.mp4"
+        # Set filepath for this clip
+        clip_name_sanitised = clip_name.with_name("_".join(clip_name.stem.split("_")[:-1])).with_suffix(".hdf").name
+        file_outpath = outpath_with_split / clip_name_sanitised
 
-            # compute visibility graph matrix (32ch)
-            # TODO: implement upsampling from 4ch -> 32ch
-            vsg_sig, apgd, mapper = get_visibility_matrix(
-                eigen_sig,
-                sr,
-                apgd=True,
-                t_sti=t_sti,
-                scale="linear",
-                nbands=9
-            )
+        # compute visibility graph matrix (32ch)
+        _, apgd, __ = get_visibility_matrix(
+            eigen_sig,
+            sr,
+            apgd=True,
+            t_sti=t_sti,
+            scale="log",
+            nbands=16
+        )
 
-            generate_acoustic_map_video(
-                apgd_arr=apgd,
-                r=mapper,
-                # Need to map to milliseconds for mpl
-                ts=t_sti * 10000,
-                f_out=file_outpath
-            )
+        # (nframes, nbands, Npx)
+        apgd_labels.append(apgd.transpose(1, 0, 2))
+        a_np = np.vstack(apgd_labels)
+
+        with File(file_outpath, "w") as f:
+            f.create_dataset("ai_apgd", shape=a_np.shape, dtype=a_np.dtype, data=a_np)
+            f.attrs["fname"] = clip_name.stem
+            f.attrs["sr"] = sr
 
 
 if __name__ == "__main__":
