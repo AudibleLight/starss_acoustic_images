@@ -11,7 +11,6 @@ use a timescale of 100 ms to match the labelling resolution of the DCASE files.
 """
 
 import math
-import pandas as pd
 import time
 from argparse import ArgumentParser
 from collections.abc import Sized, Iterable
@@ -25,6 +24,7 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 import mpl_toolkits.basemap as basemap
 import numpy as np
+import pandas as pd
 import librosa
 import skimage.util as skutil
 import scipy.constants as constants
@@ -1137,8 +1137,6 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
     # Iterate over every audio file
     for clip_name in tqdm(eigenmike_files, desc="Processing files..."):
 
-        apgd_labels = []
-
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
 
@@ -1148,9 +1146,13 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
         if not outpath_with_split.exists():
             outpath_with_split.mkdir(parents=True)
 
+        # load in metadata for this file
+        metadata_path = str(clip_name.with_suffix(".csv")).replace("eigen_dev", "metadata_dev").replace("_eigen", "")
+        metadata = pd.read_csv(metadata_path).to_numpy()
+
         # Set filepath for this clip
-        clip_name_sanitised = clip_name.with_name("_".join(clip_name.stem.split("_")[:-1])).with_suffix(".hdf").name
-        file_outpath = outpath_with_split / clip_name_sanitised
+        file_outpath = outpath_with_split / clip_name.with_suffix(".hdf").name
+        print(f"Dumping HDF file to {file_outpath}...")
 
         # compute visibility graph matrix (32ch)
         _, apgd, __ = get_visibility_matrix(
@@ -1162,14 +1164,29 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
             nbands=16
         )
 
-        # (nframes, nbands, Npx)
-        apgd_labels.append(apgd.transpose(1, 0, 2))
-        a_np = np.vstack(apgd_labels)
+        # (tesselation, bands, frames)
+        a_np = apgd.transpose((2, 0, 1))
 
         with File(file_outpath, "w") as f:
+            # overall metadata
+            f.attrs["file"] = clip_name.stem
+
+            # acoustic image
             f.create_dataset("ai_apgd", shape=a_np.shape, dtype=a_np.dtype, data=a_np)
-            f.attrs["fname"] = clip_name.stem
-            f.attrs["sr"] = sr
+            f.attrs["ai_n_frames"] = a_np.shape[0]
+            f.attrs["ai_n_bands"] = a_np.shape[1]
+
+            # audio
+            f.create_dataset("audio", shape=eigen_sig.shape, dtype=eigen_sig.dtype, data=eigen_sig)
+            f.attrs["audio_sr"] = sr
+            f.attrs["audio_duration"] = len(eigen_sig) / sr
+            f.attrs["audio_n_frames"] = f.attrs["audio_duration"] / (t_sti * 10)
+            f.attrs["audio_fpath"] = str(clip_name)
+
+            # metadata
+            f.create_dataset("metadata", shape=metadata.shape, dtype=metadata.dtype, data=metadata)
+            f.attrs["metadata_n_frames"] = metadata[:, 0].max()
+            f.attrs["metadata_fpath"] = str(metadata_path)
 
 
 if __name__ == "__main__":
