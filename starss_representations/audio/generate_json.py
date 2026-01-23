@@ -24,7 +24,9 @@ from starss_representations import utils
 DEFAULT_DATASET_PATH = utils.get_project_root() / "outputs/apgd_dev"
 DEFAULT_OUTPUT_PATH = utils.get_project_root() / "outputs/json_dev"
 
-CMAP = (np.array(plt.get_cmap("tab10").colors) * 255).astype(int).tolist()
+# Colormap: tab10 only has 10 colours, so we reflect it to have enough for every class
+cm = (np.array(plt.get_cmap("tab10").colors) * 255).astype(int).tolist()
+CMAP = [*cm, *cm, *cm]
 
 # These are taken directly from the STARSS documentation
 VIDEO_FPS = 29.97
