@@ -21,7 +21,7 @@ from h5py import File
 
 from starss_representations.video.annotate_with_yolos import extract_bounding_boxes, animate_bounding_boxes
 from starss_representations.video.annotate_with_ground_truth_metadata import process_video as ground_truth_annotate, create_annotations_map
-from starss_representations.audio.annotate_with_apgd import generate_acoustic_map_video, get_visibility_matrix
+from starss_representations.audio.generate_acoustic_image_dataset import generate_acoustic_map_video, get_visibility_matrix
 from starss_representations import utils
 
 DEFAULT_OUTPATH = utils.get_project_root() / "outputs/combined"

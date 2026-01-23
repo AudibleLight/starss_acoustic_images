@@ -4,7 +4,8 @@
 """
 Create acoustic map using APGD for an audio file.
 
-We generate a .hdf file for every .wav file, using
+We generate a .hdf file for every .wav file, containing 1) the acoustic image, 2) the associated metadata, 3) the
+spatial audio, 4) the video frames.
 
 By default, we use logarithmic spacing for frequency bands ranging from 50Hz to 4500Hz, with a total of 16 bands. We
 use a timescale of 100 ms to match the labelling resolution of the DCASE files.
@@ -24,6 +25,7 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as tri
 import mpl_toolkits.basemap as basemap
 import numpy as np
+import cv2
 import pandas as pd
 import librosa
 import skimage.util as skutil
@@ -39,6 +41,7 @@ from tqdm import tqdm
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
 from h5py import File
 
 from starss_representations import utils
@@ -1125,6 +1128,433 @@ def generate_acoustic_map_video(
     return anim
 
 
+def create_fibonacci_sphere(n_points=484):
+    """Create approximately uniform points on a sphere using Fibonacci spiral."""
+    indices = np.arange(0, n_points, dtype=float) + 0.5
+
+    phi = np.arccos(1 - 2 * indices / n_points)
+    theta = np.pi * (1 + 5 ** 0.5) * indices
+
+    x = np.cos(theta) * np.sin(phi)
+    y = -np.sin(theta) * np.sin(phi)
+    z = np.cos(phi)
+
+    return np.column_stack([x, y, z])
+
+
+def spherical_to_cartesian(azimuth_deg, elevation_deg):
+    """Convert spherical coordinates to Cartesian (x, y, z)."""
+    az_rad = np.radians(azimuth_deg)
+    el_rad = np.radians(elevation_deg)
+
+    x = np.cos(el_rad) * np.cos(az_rad)
+    y = -np.cos(el_rad) * np.sin(az_rad)
+    z = np.sin(el_rad)
+
+    return x, y, z
+
+
+def get_circle_mask(tessellation_coords, azimuth_deg, elevation_deg, radius_deg=20):
+    """
+    Get a boolean mask for tessellation points within a circle around the DOA.
+
+    Args:
+        tessellation_coords: Array of shape (n_points, 3) with unit vectors
+        azimuth_deg: Center azimuth in degrees
+        elevation_deg: Center elevation in degrees
+        radius_deg: Radius of circle in degrees
+
+    Returns:
+        Boolean mask of shape (n_points,) where True means inside circle
+    """
+    # Convert target direction to Cartesian
+    target_x, target_y, target_z = spherical_to_cartesian(azimuth_deg, elevation_deg)
+    target = np.array([target_x, target_y, target_z])
+
+    # Calculate angular distances using dot product
+    # For unit vectors: cos(angle) = dot product
+    dot_products = tessellation_coords @ target
+
+    # Clip to handle numerical errors
+    dot_products = np.clip(dot_products, -1.0, 1.0)
+
+    # Convert to angles in degrees
+    angles_deg = np.degrees(np.arccos(dot_products))
+
+    # Return mask for points within radius
+    return angles_deg <= radius_deg
+
+
+# def process_doa_matrix(matrix, metadata, radius_deg: int = 20):
+#     """
+#     Process matrix according to DOA-based masking algorithm.
+#
+#     Args:
+#         matrix: Array of shape (tessellation, bands, frames)
+#         metadata: Array of shape (n_items, 7) with columns [frame_idx, class_idx, source_idx, azimuth, elevation, distance, unique_idx]
+#         radius_deg: Radius of circle around DOA in degrees
+#
+#     Returns:
+#         Processed z-scored and clipped values of shape (tessellation, frames)
+#     """
+#     tessellation, bands, frames = matrix.shape
+#
+#     # Remove metadata rows outside the number of frames in the recording
+#     metadata = metadata[metadata[:, 0] <= frames]
+#
+#     # Create tessellation coordinates
+#     tessellation_coords = create_fibonacci_sphere(tessellation)
+#
+#     # Create a masked copy of the matrix (use np.nan for masked values)
+#     masked_matrix = matrix.astype(float).copy()
+#
+#     # Get unique items
+#     unique_items = np.unique(metadata[:, -1])
+#
+#     for item_idx in unique_items:
+#         # Get all metadata rows for this item
+#         item_metadata = metadata[metadata[:, -1] == item_idx]
+#
+#         # Get frames where this item appears
+#         item_frames = item_metadata[:, 0].astype(int)
+#
+#         # Get DOA for each frame this item appears in
+#         for i, frame_idx in enumerate(item_frames):
+#             azimuth = item_metadata[i, 3]
+#             elevation = item_metadata[i, 4]
+#
+#             # Get circle mask for this DOA
+#             circle_mask = get_circle_mask(tessellation_coords, azimuth, elevation, radius_deg)
+#
+#             # Set all tessellation points OUTSIDE the circle to NaN
+#             # circle_mask is True for inside, so ~circle_mask is True for outside
+#             masked_matrix[~circle_mask, :, frame_idx] = np.nan
+#
+#     # Step 2: Compute median across bands (ignoring NaN)
+#     # Shape: (tessellation, frames)
+#     median_energy = np.nanmedian(masked_matrix, axis=1)
+#
+#     # Step 3: Global z-scoring across all values
+#     # Flatten to compute global statistics
+#     all_values = median_energy.flatten()
+#     valid_values = all_values[~np.isnan(all_values)]
+#
+#     if len(valid_values) == 0:
+#         raise ValueError("No valid values after masking")
+#
+#     global_mean = np.nanmean(valid_values)
+#     global_std = np.nanstd(valid_values)
+#
+#     if global_std == 0:
+#         raise ValueError("Standard deviation is zero, cannot z-score")
+#
+#     z_scored = (median_energy - global_mean) / global_std
+#
+#     # Step 4: Add 0.5 to z-score distribution
+#     z_scored = z_scored + 0.5
+#
+#     # Step 5: Clip between 0 and 1
+#     clipped = np.clip(z_scored, 0, 1)
+#
+#     return clipped
+
+
+def create_circle(elevation, azimuth, radius_deg, angle):
+    lat = np.radians(elevation)
+    lon = np.radians(azimuth)
+    d = np.radians(radius_deg)
+    lat2 = np.arcsin(np.sin(lat) * np.cos(d) +
+                     np.cos(lat) * np.sin(d) * np.cos(angle))
+    lon2 = lon + np.arctan2(np.sin(angle) * np.sin(d) * np.cos(lat),
+                            np.cos(d) - np.sin(lat) * np.sin(lat2))
+    return lat2, lon2
+
+
+def draw_circle_boundary(elevation, azimuth, radius_deg, n_circle_points: int = 100) -> np.ndarray:
+    circle_points = []
+    for angle in np.linspace(0, 2 * np.pi, n_circle_points):
+        circle_points.append(*create_circle(elevation, azimuth, radius_deg, angle))
+    return np.array(circle_points)
+
+
+def visualize_masking(matrix, metadata, frame_idx, radius_deg: int = 20, n_circle_points: int = 100):
+    """
+    Visualize the energy on a sphere before and after masking for a specific frame.
+
+    Args:
+        matrix: Array of shape (tessellation, bands, frames)
+        metadata: Array of shape (n_items, 4) with columns [frame_idx, item_idx, azimuth, elevation]
+        frame_idx: Frame to visualize
+        radius_deg: Radius of circle around DOA in degrees
+        n_circle_points: Number of points to draw for the circle
+    """
+    tessellation, bands, frames = matrix.shape
+    tessellation_coords = create_fibonacci_sphere(tessellation)
+
+    # Convert tessellation coords to spherical for plotting
+    x, y, z = tessellation_coords.T
+    tess_azimuth = np.degrees(np.arctan2(-y, x))
+    tess_elevation = np.degrees(np.arcsin(z))
+
+    # Get energy for this frame (average across bands)
+    energy_before = np.mean(matrix[:, :, frame_idx], axis=1)
+
+    # Create masked version
+    masked_matrix = matrix[:, :, frame_idx].astype(float).copy()
+
+    # Get all items that appear in this frame
+    frame_metadata = metadata[metadata[:, 0] == frame_idx]
+
+    circles = []  # Store circle parameters for visualization
+
+    if len(frame_metadata) > 0:
+        # Start with all points masked (outside all circles)
+        combined_mask = np.zeros(tessellation, dtype=bool)
+
+        for row in frame_metadata:
+            azimuth, elevation = row[3], row[4]
+
+            # Get circle mask for this DOA
+            circle_mask = get_circle_mask(tessellation_coords, azimuth, elevation, radius_deg)
+            combined_mask |= circle_mask  # Union of all circles
+
+            circles.append((azimuth, elevation))
+
+        # Mask points outside all circles
+        masked_matrix[~combined_mask, :] = np.nan
+
+    # Get energy after masking
+    energy_after = np.nanmean(masked_matrix, axis=1)
+
+    # Create figure with 2 subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6),
+                                   subplot_kw={'projection': 'mollweide'})
+
+    # Plot 1: Before masking
+    scatter1 = ax1.scatter(np.radians(tess_azimuth), np.radians(tess_elevation),
+                           c=energy_before, cmap='viridis', s=20, alpha=0.6)
+    ax1.set_title(f'Frame {frame_idx}: Energy Before Masking', fontsize=14)
+    ax1.set_xlabel('Azimuth (degrees)', fontsize=12)
+    ax1.set_ylabel('Elevation (degrees)', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    plt.colorbar(scatter1, ax=ax1, label='Energy')
+
+    # Draw circles for each DOA
+    for azimuth, elevation in circles:
+        # Draw circle center
+        ax1.plot(np.radians(azimuth), np.radians(elevation),
+                 'r*', markersize=20, markeredgecolor='white', markeredgewidth=1.5)
+
+        # Draw circle boundary (approximate)
+        circle_points = draw_circle_boundary(elevation, azimuth, radius_deg, n_circle_points)
+        ax1.plot(circle_points[:, 0], circle_points[:, 1], 'r-', linewidth=2, alpha=0.7)
+
+    # Plot 2: After masking
+    # Only plot non-NaN values
+    valid_mask = ~np.isnan(energy_after)
+    scatter2 = ax2.scatter(np.radians(tess_azimuth[valid_mask]),
+                           np.radians(tess_elevation[valid_mask]),
+                           c=energy_after[valid_mask], cmap='viridis', s=20, alpha=0.6)
+    ax2.set_title(f'Frame {frame_idx}: Energy After Masking', fontsize=14)
+    ax2.set_xlabel('Azimuth (degrees)', fontsize=12)
+    ax2.set_ylabel('Elevation (degrees)', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    plt.colorbar(scatter2, ax=ax2, label='Energy')
+
+    # Draw circles for each DOA
+    for azimuth, elevation in circles:
+        ax2.plot(np.radians(azimuth), np.radians(elevation),
+                 'r*', markersize=20, markeredgecolor='white', markeredgewidth=1.5)
+
+        # Draw circle boundary
+        circle_points = draw_circle_boundary(elevation, azimuth, radius_deg, n_circle_points)
+        ax2.plot(circle_points[:, 0], circle_points[:, 1], 'r-', linewidth=2, alpha=0.7)
+    plt.tight_layout()
+
+    # Print statistics
+    n_masked = np.sum(~valid_mask)
+    n_total = len(energy_after)
+    print(f"\nFrame {frame_idx} Statistics:")
+    print(f"  Number of DOAs in frame: {len(circles)}")
+    if circles:
+        print(f"  DOA positions: {circles}")
+    print(f"  Points masked: {n_masked}/{n_total} ({100 * n_masked / n_total:.1f}%)")
+    print(f"  Energy range before: [{np.min(energy_before):.3f}, {np.max(energy_before):.3f}]")
+    print(f"  Energy range after: [{np.nanmin(energy_after):.3f}, {np.nanmax(energy_after):.3f}]")
+
+    return fig
+
+
+def metadata_frame_to_video_frame(metadata_frame_idx, video_fps=29.97, metadata_fps=10.0):
+    """
+    Convert metadata frame index to video frame index.
+
+    Args:
+        metadata_frame_idx: Frame index from metadata (100ms resolution = 10 fps)
+        video_fps: Video frames per second (default 29.97)
+        metadata_fps: Metadata frames per second (default 10.0 for 100ms)
+
+    Returns:
+        Video frame index (integer)
+    """
+    # Convert metadata frame to time in seconds
+    time_seconds = metadata_frame_idx / metadata_fps
+
+    # Convert time to video frame
+    video_frame_idx = int(time_seconds * video_fps)
+
+    return video_frame_idx
+
+
+def spherical_to_equirectangular(azimuth_deg, elevation_deg, img_width=1920, img_height=960):
+    """
+    Convert spherical coordinates to equirectangular pixel coordinates.
+
+    Args:
+        azimuth_deg: Azimuth in degrees [-180, 180]
+        elevation_deg: Elevation in degrees [-90, 90]
+        img_width: Image width in pixels
+        img_height: Image height in pixels
+
+    Returns:
+        (x, y) pixel coordinates
+    """
+    # Normalize azimuth from [-180, 180] to [0, img_width]
+    # Azimuth 0° should be at center (x = img_width/2)
+    # Azimuth -180° should be at left edge (x = 0)
+    # Azimuth +180° should be at right edge (x = img_width)
+    x = ((azimuth_deg + 180) % 360) / 360.0 * img_width
+
+    # Normalize elevation from [-90, 90] to [0, img_height]
+    # Elevation +90° (up) should be at top (y = 0)
+    # Elevation -90° (down) should be at bottom (y = img_height)
+    y = (90 - elevation_deg) / 180.0 * img_height
+
+    return int(x), int(y)
+
+
+def draw_circle_on_equirectangular(img, azimuth_deg, elevation_deg, radius_deg=20,
+                                   color=(255, 0, 0), thickness=2, n_points=100):
+    """
+    Draw a circle on an equirectangular image.
+
+    Args:
+        img: Image array (H, W, 3)
+        azimuth_deg: Center azimuth in degrees
+        elevation_deg: Center elevation in degrees
+        radius_deg: Radius in degrees
+        color: BGR color tuple
+        thickness: Line thickness
+        n_points: Number of points for circle approximation
+
+    Returns:
+        Image with circle drawn
+    """
+    img_height, img_width = img.shape[:2]
+
+    # Draw circle boundary
+    circle_points_pixel = []
+    for angle in np.linspace(0, 2 * np.pi, n_points):
+        # Create the circle
+
+        lat2, lon2 = create_circle(elevation_deg, azimuth_deg, radius_deg, angle)
+        # Convert to degrees
+        az2 = np.degrees(lon2)
+        el2 = np.degrees(lat2)
+
+        # Convert to pixel coordinates
+        x, y = spherical_to_equirectangular(az2, el2, img_width, img_height)
+        circle_points_pixel.append([x, y])
+
+    # Draw the circle
+    circle_points_pixel = np.array(circle_points_pixel, dtype=np.int32)
+    cv2.polylines(img, [circle_points_pixel], isClosed=True,
+                  color=color, thickness=thickness)
+
+    # Draw center point
+    center_x, center_y = spherical_to_equirectangular(azimuth_deg, elevation_deg,
+                                                      img_width, img_height)
+    cv2.drawMarker(img, (center_x, center_y), color,
+                   markerType=cv2.MARKER_STAR, markerSize=20, thickness=2)
+
+    return img
+
+
+def overlay_doa_on_video_frame(video_path, metadata, metadata_frame_idx,
+                               radius_deg=20, output_path=None):
+    """
+    Overlay DOA annotations on the corresponding video frame.
+
+    Args:
+        video_path: Path to the video file
+        metadata: Metadata array with shape (n_items, 7)
+        metadata_frame_idx: Frame index from metadata to visualize
+        radius_deg: Radius of DOA circle in degrees
+        output_path: Optional path to save the annotated frame
+
+    Returns:
+        Annotated video frame as numpy array
+    """
+    # Convert metadata frame to video frame
+    video_frame_idx = metadata_frame_to_video_frame(metadata_frame_idx)
+
+    # Open video
+    cap = cv2.VideoCapture(video_path)
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    print(f"Video FPS: {fps}")
+    print(f"Total video frames: {total_frames}")
+    print(f"Metadata frame {metadata_frame_idx} -> Video frame {video_frame_idx}")
+
+    # Seek to the correct frame
+    cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
+
+    # Read frame
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        raise ValueError(f"Could not read frame {video_frame_idx}")
+
+    # Get all DOAs for this metadata frame
+    frame_metadata = metadata[metadata[:, 0] == metadata_frame_idx]
+
+    # Draw circles for each DOA
+    for row in frame_metadata:
+        azimuth = row[3]
+        elevation = row[4]
+        class_idx = int(row[1])
+
+        # Use different colors for different classes
+        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+                  (255, 0, 255), (0, 255, 255)]
+        color = colors[class_idx % len(colors)]
+
+        frame = draw_circle_on_equirectangular(frame, azimuth, elevation,
+                                               radius_deg, color=color, thickness=3)
+
+        # Add text label
+        center_x, center_y = spherical_to_equirectangular(azimuth, elevation,
+                                                          frame.shape[1], frame.shape[0])
+        cv2.putText(frame, f"Class {class_idx}", (center_x + 25, center_y - 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    # Add frame info
+    cv2.putText(frame, f"Metadata Frame: {metadata_frame_idx} | Video Frame: {video_frame_idx}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    cap.release()
+
+    # Save if output path provided
+    if output_path:
+        cv2.imwrite(output_path, frame)
+        print(f"Saved annotated frame to {output_path}")
+
+    return frame
+
+
 # why does t_sti need to be 0.01 for 100 ms resolution? Shouldn't it be 0.1?
 def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
     eigenmike_files = [p for p in Path(data_src).rglob("**/*.wav") if "._" not in str(p)]
@@ -1146,9 +1576,24 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
         if not outpath_with_split.exists():
             outpath_with_split.mkdir(parents=True)
 
+        # load up the video for this file
+        video_path = str(clip_name.with_suffix(".mp4")).replace("eigen_dev", "video_dev", )
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise IOError("Cannot open video file")
+
+        # get attributes from the video
+        video_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        video_fps = float(cap.get(cv2.CAP_PROP_FPS))
+
         # load in metadata for this file
-        metadata_path = str(clip_name.with_suffix(".csv")).replace("eigen_dev", "metadata_dev").replace("_eigen", "")
-        metadata = pd.read_csv(metadata_path).to_numpy()
+        metadata_path = str(clip_name.with_suffix(".csv")).replace("eigen_dev", "metadata_dev")
+        metadata = pd.read_csv(metadata_path)
+        metadata.columns = ['frame', 'class_idx', 'source_idx', 'azimuth', 'elevation', 'distance']
+        metadata["unique_source"] = metadata.groupby(["class_idx", "source_idx"]).ngroup()
+        metadata = metadata.to_numpy()
 
         # Set filepath for this clip
         file_outpath = outpath_with_split / clip_name.with_suffix(".hdf").name
@@ -1161,7 +1606,8 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
             apgd=True,
             t_sti=t_sti,
             scale="log",
-            nbands=16
+            nbands=2,
+            frame_cap=100
         )
 
         # (tesselation, bands, frames)
@@ -1187,6 +1633,15 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
             f.create_dataset("metadata", shape=metadata.shape, dtype=metadata.dtype, data=metadata)
             f.attrs["metadata_n_frames"] = metadata[:, 0].max()
             f.attrs["metadata_fpath"] = str(metadata_path)
+
+            # video
+            f.attrs["video_fpath"] = str(video_path)
+            f.attrs["video_n_frames"] = video_num_frames
+            f.attrs["video_resolution"] = (video_width, video_height)
+            f.attrs["video_fps"] = video_fps
+
+        # make sure to close the video!
+        cap.release()
 
 
 if __name__ == "__main__":
