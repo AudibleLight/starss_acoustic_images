@@ -9,6 +9,8 @@ be used during training, and 2) annotated videos showing the acoustic image over
 import json
 from argparse import ArgumentParser
 from pathlib import Path
+from shutil import rmtree
+from uuid import uuid4
 
 import astropy.coordinates as coord
 import astropy.units as u
@@ -356,13 +358,27 @@ def unwrap_contour_x(contour, width):
     return cnt
 
 
+def save_test_frame(test_idx: int, frame: np.ndarray) -> None:
+    tc_folder = utils.get_project_root() / "test_cases" / f"tc{test_idx}"
+    full_path = (tc_folder / str(uuid4())).with_suffix(".png")
+    cv2.imwrite(full_path, frame)
+
+
 def main(dataset_src: str, output_path: str):
     hdf_files = [p for p in Path(dataset_src).rglob("**/*.hdf")]
     # hdf_files = [Path("/home/huw-cheston/Documents/python_projects/starss_representations/outputs/apgd_dev/dev-train-tau/fold3_room13_mix009.hdf")]
 
+    # Make output paths
     output_path = Path(output_path)
     if not output_path.exists():
         output_path.mkdir()
+
+    # Create test case folders
+    for i in range(1, 9):
+        tc_folder = utils.get_project_root() / "test_cases" / "tc{i}".format(i=i)
+        if tc_folder.exists():
+            rmtree(tc_folder)
+        tc_folder.mkdir(parents=True, exist_ok=True)
 
     for hdx_idx, hdf_file in enumerate(hdf_files):
         split = hdf_file.parent.name
@@ -462,8 +478,11 @@ def main(dataset_src: str, output_path: str):
             # If we've got metadata for this frame
             if metadata_frame_idx in frames_with_gt_annotations:
 
+                n_polygons = 0
+
                 # We can have multiple sound sources at each time so need to iterate again
-                for metadata_row in metadata_[metadata_[:, 0] == metadata_frame_idx]:
+                current_rows = metadata_[metadata_[:, 0] == metadata_frame_idx]
+                for metadata_row in current_rows:
 
                     # Grab everything from the row of metadata
                     _, class_id, instance_id, gt_az, gt_el, gt_dist = metadata_row[:6]
@@ -499,6 +518,7 @@ def main(dataset_src: str, output_path: str):
                     # Compute the polygon boundaries: need to wrap around both sides of the image
                     binary_mask = (acoustic_image_gauss_masked > 0).astype(np.uint8) * 255
                     contours = find_wrapped_contours(binary_mask)
+
                     for cnt in contours:
                         split_contours = split_contour_on_seam(cnt)
                         for sc in split_contours:
@@ -525,6 +545,7 @@ def main(dataset_src: str, output_path: str):
 
                             # Draw the contour on the frame
                             frame = cv2.drawContours(frame, [sc], -1, color, 1)
+                            n_polygons += 1
 
                     # Overlay Gaussian scaled acoustic image: use a different colormap
                     # TODO: reduce transparency
@@ -539,6 +560,38 @@ def main(dataset_src: str, output_path: str):
 
                     # Add the results to the overall dict
                     dataset_res["annotations"].append(annotations_dict)
+
+                    # Test case 1: high polygon (elevation / height > 0.95)
+                    if gt_el_eq / VIDEO_HEIGHT > 0.95 and len(contours) >= 1:
+                        save_test_frame(1, frame)
+
+                    # Test case 2: low polygon (elevation / height < 0.05)
+                    if gt_el_eq / VIDEO_HEIGHT < 0.05 and len(contours) >= 1:
+                        save_test_frame(2, frame)
+
+                    # Test case 3: wrapping at left edge of screen
+                    if gt_az_eq / VIDEO_WIDTH < 0.05 and len(contours) >= 1:
+                        save_test_frame(3, frame)
+
+                    # Test case 4: two polygons, one frame
+                    if gt_az_eq / VIDEO_WIDTH > 0.95 and len(contours) >= 1:
+                        save_test_frame(4, frame)
+
+                    # Test case 5: ground truth with no polygons
+                    if len(contours) == 0:
+                        save_test_frame(5, frame)
+
+                # Test case 6: three+ polygons, one frame
+                if n_polygons >= 3:
+                    save_test_frame(6, frame)
+
+                # Test case 7: more annotations than polygons
+                if len(current_rows) > n_polygons:
+                    save_test_frame(7, frame)
+
+                # Test case 8: more polygons than annotations
+                if len(current_rows) < n_polygons:
+                    save_test_frame(8, frame)
 
             # Write the frame
             writer.write(frame)

@@ -4,6 +4,7 @@
 *.wav
 *.mp3
 *.hdf
+*.png
 
 # created by virtualenv automatically
 /venv
