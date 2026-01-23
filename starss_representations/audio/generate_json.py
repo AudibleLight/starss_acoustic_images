@@ -374,7 +374,7 @@ def main(dataset_src: str, output_path: str):
         output_path.mkdir()
 
     # Create test case folders
-    for i in range(1, 9):
+    for i in range(1, 10):
         tc_folder = utils.get_project_root() / "test_cases" / "tc{i}".format(i=i)
         if tc_folder.exists():
             rmtree(tc_folder)
@@ -569,29 +569,33 @@ def main(dataset_src: str, output_path: str):
                     if gt_el_eq / VIDEO_HEIGHT < 0.05 and len(contours) >= 1:
                         save_test_frame(2, frame)
 
-                    # Test case 3: wrapping at left edge of screen
+                    # Test case 3: polygon wrapping at left edge of screen (azimuth / width < 0.05)
                     if gt_az_eq / VIDEO_WIDTH < 0.05 and len(contours) >= 1:
                         save_test_frame(3, frame)
 
-                    # Test case 4: two polygons, one frame
+                    # Test case 4: polygon wrapping at right edge of screen (azimuth / width > 0.95)
                     if gt_az_eq / VIDEO_WIDTH > 0.95 and len(contours) >= 1:
                         save_test_frame(4, frame)
 
-                    # Test case 5: ground truth with no polygons
-                    if len(contours) == 0:
+                    # Test case 5: two polygons for one sound source
+                    if gt_az_eq / VIDEO_WIDTH > 0.95 and len(contours) >= 1:
                         save_test_frame(5, frame)
 
-                # Test case 6: three+ polygons, one frame
-                if n_polygons >= 3:
-                    save_test_frame(6, frame)
+                    # Test case 6: ground truth label with no polygons
+                    if len(contours) == 0:
+                        save_test_frame(6, frame)
 
-                # Test case 7: more annotations than polygons
-                if len(current_rows) > n_polygons:
+                # Test case 7: three+ polygons for all sources on one frame
+                if n_polygons >= 3:
                     save_test_frame(7, frame)
 
-                # Test case 8: more polygons than annotations
-                if len(current_rows) < n_polygons:
+                # Test case 8: more annotations than polygons
+                if len(current_rows) > n_polygons:
                     save_test_frame(8, frame)
+
+                # Test case 9: more polygons than annotations
+                if len(current_rows) < n_polygons:
+                    save_test_frame(9, frame)
 
             # Write the frame
             writer.write(frame)
