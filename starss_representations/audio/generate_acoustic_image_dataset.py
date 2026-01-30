@@ -13,35 +13,26 @@ use a timescale of 100 ms to match the labelling resolution of the DCASE files.
 
 import math
 import time
+import json
 from argparse import ArgumentParser
-from collections.abc import Sized, Iterable
 from pathlib import Path
 
 import astropy.coordinates as coord
 import astropy.units as u
-import matplotlib.colors as cm
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
-import matplotlib.tri as tri
-import mpl_toolkits.basemap as basemap
 import numpy as np
 import cv2
 import pandas as pd
 import librosa
-import skimage.util as skutil
-import scipy.constants as constants
 import scipy.linalg as linalg
 import scipy.sparse.linalg as splinalg
-import scipy.special as special
-import scipy.signal.windows as windows
 import scipy.io.wavfile as wavfile
 import pyunlocbox as opt
 from pyunlocbox.functions import dummy
 from tqdm import tqdm
-from sklearn.cluster import KMeans
-from sklearn.mixture import GaussianMixture
-from matplotlib.animation import FuncAnimation
-from mpl_toolkits.mplot3d import Axes3D
+from scipy.constants import speed_of_sound
+from scipy.signal.windows import tukey
+from scipy.interpolate import griddata
+from skimage.util import view_as_blocks, view_as_windows
 from h5py import File
 
 from starss_representations import utils
@@ -83,220 +74,20 @@ EIGENMIKE_COORDS = {
 DEFAULT_EIGEN_DIRECTORY = utils.get_project_root() / "data/eigen_dev"
 DEFAULT_OUTPATH = utils.get_project_root() / "outputs/apgd_dev"
 
-
-def _deg2rad(coords_dict):
-    """
-    Take a dictionary with microphone array capsules and 3D polar coordinates to convert them from degrees to radians
-    colatitude, azimuth, and radius (radius is left intact)
-    """
-    return {
-        m: [math.radians(c[0]), math.radians(c[1]), c[2]]
-        for m, c in coords_dict.items()
-    }
-
-
-def _polar2cart(coords_dict, units=None):
-    """
-    Take a dictionary with microphone array capsules and polar coordinates and convert to cartesian
-    """
-    if units is None or units != "degrees" and units != "radians":
-        raise ValueError("you must specify units of 'degrees' or 'radians'")
-    elif units == "degrees":
-        coords_dict = _deg2rad(coords_dict)
-    return {
-        m: [
-            c[2] * math.sin(c[0]) * math.cos(c[1]),
-            c[2] * math.sin(c[0]) * math.sin(c[1]),
-            c[2] * math.cos(c[0]),
-        ]
-        for m, c in coords_dict.items()
-    }
-
-
-def eq2cart(r, lat, lon):
-    r = np.array([r])  # if chk.is_scalar(r) else np.array(r, copy=False)
-    if np.any(r < 0):
-        raise ValueError("Parameter[r] must be non-negative.")
-
-    return (
-        coord.SphericalRepresentation(lon * u.rad, lat * u.rad, r)
-        .to_cartesian()
-        .xyz.to_value(u.dimensionless_unscaled)
-    )
-
-
-def pol2cart(r, colat, lon):
-    lat = (np.pi / 2) - colat
-    return eq2cart(r, lat, lon)
-
-
-def get_xyz():
-    mic_coords = _polar2cart(EIGENMIKE_COORDS, units='degrees')
-    xyz = [[coo_ for coo_ in mic_coords[ch]] for ch in mic_coords]
-    return xyz
-
-
-def spherical_jn_series_threshold(x, table_lookup=True, epsilon=1e-2):
-    r"""
-    Convergence threshold of series :math:`f_{n}(x) = \sum_{q = 0}^{n} (2 q + 1) j_{q}^{2}(x)`.
-    """
-    if not (0 < epsilon < 1):
-        raise ValueError("Parameter[epsilon] must lie in (0, 1).")
-
-    if table_lookup:
-        abs_path = utils.get_project_root() / "starss_representations/audio/spherical_jn_series_threshold.csv"
-        data = pd.read_csv(abs_path).sort_values(by="x")
-
-        x = np.abs(x)
-        idx = int(np.digitize(x, bins=data["x"].values))
-        if idx == 0:  # Below smallest known x.
-            n = data["n_threshold"].iloc[0]
-        else:
-            if idx == len(data):  # Above largest known x.
-                ratio = data["n_threshold"].iloc[-1] / data["x"].iloc[-1]
-            else:
-                ratio = data["n_threshold"].iloc[idx - 1] / data["x"].iloc[idx - 1]
-            n = int(np.ceil(ratio * x))
-
-        return n
-    else:
-
-        def series(n_, x_):
-            q = np.arange(n_)
-            _2q1 = 2 * q + 1
-            _sph = special.spherical_jn(q, x_) ** 2
-
-            return np.sum(_2q1 * _sph)
-
-        n_opt = int(0.95 * x)
-        while True:
-            n_opt += 1
-            if 1 - series(n_opt, x) < epsilon:
-                return n_opt
-
-
-def nyquist_rate(xyz, wl):
-    """
-    Order of imageable complex plane-waves by an instrument.
-    """
-    baseline = linalg.norm(xyz[:, np.newaxis, :] - xyz[:, :, np.newaxis], axis=0)
-    return spherical_jn_series_threshold((2 * np.pi / wl) * baseline.max())
-
-
-def fibonacci(n, direction=None, fo_v=None):
-    # This is the type of tesselation that we are using
-
-    if direction is not None:
-        direction = np.array(direction, dtype=float)
-        direction /= linalg.norm(direction)
-
-        if fo_v is not None:
-            if not (0 < np.rad2deg(fo_v) < 360):
-                raise ValueError("Parameter[FoV] must be in (0, 360) degrees.")
-        else:
-            raise ValueError("Parameter[FoV] must be specified if Parameter[direction] provided.")
-
-    if n < 0:
-        raise ValueError("Parameter[N] must be non-negative.")
-
-    n_px = 4 * (n + 1) ** 2
-    n = np.arange(n_px)
-
-    colat = np.arccos(1 - (2 * n + 1) / n_px)
-    lon = (4 * np.pi * n) / (1 + np.sqrt(5))
-    xyz = np.stack(pol2cart(1, colat, lon), axis=0)
-
-    if direction is not None:  # region-limited case.
-        # TODO: highly inefficient to generate the grid this way!
-        min_similarity = np.cos(fo_v / 2)
-        mask = (direction @ xyz) >= min_similarity
-        xyz = xyz[:, mask]
-
-    # these are the cartesian coordinates of the tesselation
-    #  need to turn this into azimuth + elevation
-    #  need to do the inverse of this: cart2pol
-    #  sphere will have fewer points at the poles than expected
-    #  to fill these, we need to do another interpolation
-    return xyz
-
-
-def get_field():
-    # TODO: this is what we need to mess with
-    sh_order = 10
-    r = fibonacci(sh_order)
-    r_mask = np.abs(r[2, :]) < np.sin(np.deg2rad(90))
-    r = r[:, r_mask]  # Shrink visible view to avoid border effects.
-    # this is cartesian coordinates: (3, n_px)
-    return r
-
-
-def steering_operator(xyz, r):
-    """
-    Steering matrix.
-    """
-    freq, bw = np.linspace(50, 4500, 9), 50.0  # [Hz]
-    wl = constants.speed_of_sound / (freq.max() + 500)
-    if wl <= 0:
-        raise ValueError("Parameter[wl] must be positive.")
-
-    scale = 2 * np.pi / wl
-    return np.exp((-1j * scale * xyz.T) @ r)
-
-
-def extract_visibilities(_data, _rate, t, fc, bw, alpha):
-    """
-    Transform time-series to visibility matrices.
-    """
-    n_stft_sample = int(_rate * t)
-    if n_stft_sample == 0:
-        raise ValueError('Not enough samples per time frame.')
-    # print(f'Samples per STFT: {N_stft_sample}')
-
-    n_sample = (_data.shape[0] // n_stft_sample) * n_stft_sample
-    n_channel = _data.shape[1]
-    stf_data = (skutil.view_as_blocks(_data[:n_sample], (n_stft_sample, n_channel))
-                .squeeze(axis=1))  # (n_stf, N_stft_sample, n_channel)
-
-    window = windows.tukey(M=n_stft_sample, alpha=alpha, sym=True).reshape(1, -1, 1)
-    stf_win_data = stf_data * window  # (n_stf, N_stft_sample, n_channel)
-    n_stf = stf_win_data.shape[0]
-
-    stft_data = np.fft.fft(stf_win_data, axis=1)  # (n_stf, N_stft_sample, n_channel)
-    # Find frequency channels to average together.
-    idx_start = int((fc - 0.5 * bw) * n_stft_sample / _rate)
-    idx_end = int((fc + 0.5 * bw) * n_stft_sample / _rate)
-    collapsed_spectrum = np.sum(stft_data[:, idx_start:idx_end + 1, :], axis=1)
-
-    # Don't understand yet why conj() on first term?
-    # collapsed_spectrum = collapsed_spectrum[0,:]
-    return (
-            collapsed_spectrum.reshape(n_stf, -1, 1).conj() *
-            collapsed_spectrum.reshape(n_stf, 1, -1)
-    )
-
-
-# noinspection PyArgumentList
-def eigh_max(a):
-    r"""
-    Evaluate :math:`\mu_{\max}(\bbB)` with
-
-    :math:
-    B = (\overline{\bbA} \circ \bbA)^{H} (\overline{\bbA} \circ \bbA)
-    """
-    if a.ndim != 2:
-        raise ValueError('Parameter[A] has wrong dimensions.')
-
-    def matvec(v):
-        v = v.reshape(-1)
-
-        c = (a * v) @ a.conj().T
-        d = c @ a
-        return np.sum(a.conj() * d, axis=0).real
-
-    m, n = a.shape
-    b = splinalg.LinearOperator(shape=(n, n), matvec=matvec, dtype=np.float64)
-    d_max = splinalg.eigsh(b, k=1, which='LM', return_eigenvectors=False)
-    return d_max[0]
+#  Values taken from LAM paper
+FMIN, FMAX = 1500, 4500
+NBANDS = 9
+# NBANDS = 2
+SCALE = "linear"
+BANDWIDTH = 50.0
+# why does t_sti need to be 0.01 for 100 ms resolution? Shouldn't it be 0.1?
+TSTI = 10e-3
+FRAME_CAP = None
+# FRAME_CAP = 10
+SH_ORDER = 10
+CIRCLE_RADIUS_DEG = 20
+POLYGON_MASK_THRESHOLD = 4e-5
+RESOLUTION = 640, 320
 
 
 class L2Loss(opt.functions.func):
@@ -410,13 +201,13 @@ class GroundTruthAccel(opt.acceleration.accel):
         """
         pass
 
-    def _update_step(self, solver, objective, niter):
+    def _update_step(self, solver, objective, niter):  # noqa
         """
         Update the step size for the next iteration.
         """
         return self._step
 
-    def _update_sol(self, solver, objective, niter):
+    def _update_sol(self, solver, objective, niter):  # noqa
         """
         Update the solution point for the next iteration.
         """
@@ -433,6 +224,298 @@ class GroundTruthAccel(opt.acceleration.accel):
         Post-processing specific to the acceleration scheme.
         """
         pass
+
+
+def _degrees_to_radians(coords_dict: dict[str, list]) -> dict[str, list]:
+    """
+    Take a dictionary with microphone array capsules and 3D polar coordinates to convert them from degrees to radians
+    colatitude, azimuth, and radius (radius is left intact)
+    """
+    return {
+        m: [math.radians(c[0]), math.radians(c[1]), c[2]]
+        for m, c in coords_dict.items()
+    }
+
+
+def _polar_to_cartesian(coords_dict: dict[str, list], units: str = None):
+    """
+    Take a dictionary with microphone array capsules and polar coordinates and convert to cartesian
+    """
+    if (
+            units is None
+            or not isinstance(units, str)
+            or units.lower() not in ["degrees", "radians"]
+    ):
+        raise ValueError("Units must be specified as one of 'degrees' or 'radians'")
+    elif units.lower() == "degrees":
+        coords_dict = _degrees_to_radians(coords_dict)
+    return {
+        m: [
+            c[2] * math.sin(c[0]) * math.cos(c[1]),
+            c[2] * math.sin(c[0]) * math.sin(c[1]),
+            c[2] * math.cos(c[0]),
+        ]
+        for m, c in coords_dict.items()
+    }
+
+
+def _equirectangular_to_cartesian(r, lat, lon):
+    """
+    Convert equirectangular values in form radius, latitude, longitude to cartesian
+    """
+    r = np.array([r])
+
+    # Must be non-negative
+    if np.any(r < 0):
+        raise ValueError("Parameter `r` must be non-negative.")
+
+    return (
+        coord.SphericalRepresentation(lon * u.rad, lat * u.rad, r)
+        .to_cartesian()
+        .xyz.to_value(u.dimensionless_unscaled)
+    )
+
+
+def _equirectangular_to_spherical(
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+) -> tuple[int, int]:
+    """
+    Convert equirectangular pixel coordinates back to spherical coordinates.
+
+    Arguments:
+        x: Pixel x-coordinate
+        y: Pixel y-coordinate
+        width: Width in pixels
+        height: Height in pixels
+
+    Returns:
+        (azimuth_deg, elevation_deg)
+    """
+    azimuth_deg = 180.0 - (x / width) * 360.0
+    elevation_deg = 90.0 - (y / height) * 180.0
+    return azimuth_deg, elevation_deg
+
+
+def _cartesian_to_spherical(x: int, y: int, z: int) -> tuple[int, int]:
+    """
+    Convert Cartesian (x, y, z) to spherical (azimuth, elevation) in degrees.
+    """
+    azimuth = np.degrees(np.arctan2(y, x))
+    elevation = np.degrees(np.arcsin(z))
+    return azimuth, elevation
+
+
+def _spherical_to_equirectangular(
+        azimuth_deg: int,
+        elevation_deg: int,
+        width: int,
+        height: int,
+) -> tuple[int, int]:
+    """
+    Convert spherical coordinates to equirectangular pixel coordinates.
+
+    Arguments:
+        azimuth_deg: Azimuth in degrees [-180, 180]
+        elevation_deg: Elevation in degrees [-90, 90]
+        width: Width in pixels
+        height: Height in pixels
+
+    Returns:
+        (x, y) pixel coordinates
+    """
+    # normalise azimuth from [-180, 180] to [0, img_width]
+    #  azimuth 0° should be at centre (x = img_width/2)
+    #  azimuth -180° should be at left edge (x = 0)
+    #  azimuth +180° should be at right edge (x = img_width)
+    x = ((-azimuth_deg + 180) % 360) / 360.0 * width
+
+    # normalise elevation from [-90, 90] to [0, img_height]
+    #  elevation +90° (up) should be at top (y = 0)
+    #  elevation -90° (down) should be at bottom (y = img_height)
+    y = (90 - elevation_deg) / 180.0 * height
+
+    return int(x), int(y)
+
+
+def get_xyz():
+    mic_coords = _polar_to_cartesian(EIGENMIKE_COORDS, units='degrees')
+    xyz = [[coo_ for coo_ in mic_coords[ch]] for ch in mic_coords]
+    return xyz
+
+
+def fibonacci(
+        n: int,
+        direction: np.ndarray = None,
+        fo_v: float = None,
+) -> np.ndarray:
+    """
+    Generate points on a unit sphere using Fibonacci lattice sampling.
+
+    The Fibonacci lattice provides a nearly uniform distribution of points on a sphere's surface, making it ideal for
+    spherical sampling applications. Points can optionally be limited to a specific region defined by a direction
+    vector and field of view.
+
+    Arguments:
+        n (Numeric): Refinement level that determines the number of points. The total number of points generated is
+            `4 * (n + 1)^2`.
+        direction (np.ndarray, optional): A 3D unit vector specifying the central direction for region-limited
+            sampling. Must be provided together with `fo_v`. If None, generates points over the entire sphere.
+        fo_v (Numeric, optional): Field of view in radians, defining the angular extent of the region around
+            `direction`. Must be in the range (0, 2π) or equivalently (0, 360) degrees. Required if `direction` is
+            specified.
+
+    Returns:
+        np.ndarray: Array of shape (3, m) containing the Cartesian coordinates (x, y, z) of points on the unit sphere,
+            where m ≤ 4 * (n + 1)^2. When region-limited, m is reduced to include only points within the specified FOV.
+    """
+
+    def _pol2cart(r, col, lo):
+        lat = (np.pi / 2) - col
+        return _equirectangular_to_cartesian(r, lat, lo)
+
+    # This is the type of tesselation that we are using
+    if direction is not None:
+        direction = np.array(direction, dtype=float)
+        direction /= linalg.norm(direction)
+
+        if fo_v is not None:
+            if not (0 < np.rad2deg(fo_v) < 360):
+                raise ValueError("Parameter `fo_v` must be in (0, 360) degrees.")
+        else:
+            raise ValueError(
+                "Parameter `fo_v` must be specified if `direction` is provided."
+            )
+
+    if n < 0:
+        raise ValueError("Parameter `n` must be non-negative.")
+
+    n_px = 4 * (n + 1) ** 2
+    n = np.arange(n_px)
+
+    colat = np.arccos(1 - (2 * n + 1) / n_px)
+    lon = (4 * np.pi * n) / (1 + np.sqrt(5))
+    xyz = np.stack(_pol2cart(1, colat, lon), axis=0)
+
+    if direction is not None:  # region-limited case.
+        # TODO: highly inefficient to generate the grid this way!
+        min_similarity = np.cos(fo_v / 2)
+        mask = (direction @ xyz) >= min_similarity
+        xyz = xyz[:, mask]
+
+    # these are the cartesian coordinates of the tesselation
+    #  need to turn this into azimuth + elevation
+    #  need to do the inverse of this: cart2pol
+    #  sphere will have fewer points at the poles than expected
+    #  to fill these, we need to do another interpolation
+    return xyz
+
+
+def get_field(sh_order: int = 10) -> np.ndarray:
+    """
+    Generate a hemisphere of sampling points for spherical harmonic field visualization.
+
+    Creates a Fibonacci lattice on a unit sphere and filters it to retain only points within the upper hemisphere
+    (i.e., z ≥ 0), with additional border trimming to avoid edge artifacts in visualization or processing.
+
+    Arguments:
+        sh_order (Numeric): Spherical harmonic order that determines sampling density. Higher orders produce more
+            points. Defaults to `config.AIMG_SH_ORDER`. The initial grid contains `4 * (sh_order + 1)^2` points before
+            filtering.
+
+    Returns:
+        np.ndarray: Array of shape (3, n) containing Cartesian coordinates (x, y, z) of points on the upper hemisphere.
+    """
+
+    # generate lattice
+    r = fibonacci(sh_order)
+    r_mask = np.abs(r[2, :]) < np.sin(np.deg2rad(90))
+    r = r[:, r_mask]  # Shrink visible view to avoid border effects.
+    # this is cartesian coordinates: (3, n_px)
+    return r
+
+
+def steering_operator(
+        xyz: np.ndarray,
+        r: int,
+        fmin: int = FMIN,
+        fmax: int = FMAX,
+        n_bands: int = NBANDS,
+) -> np.ndarray:
+    """
+    Compute steering matrix.
+    """
+    freq = np.linspace(fmin, fmax, n_bands)
+    wl = speed_of_sound / (freq.max() + 500)
+    if wl <= 0:
+        raise ValueError(f"Parameter `wl` must be positive (got {wl}).")
+
+    scale = 2 * np.pi / wl
+    return np.exp((-1j * scale * xyz.T) @ r)
+
+
+def extract_visibilities(
+        data_: np.ndarray,
+        rate_: int,
+        t: int,
+        fc: int,
+        bw: int,
+        alpha: float,
+) -> np.ndarray:
+    """
+    Transform time-series to visibility matrices.
+    """
+    n_stft_sample = int(rate_ * t)
+    if n_stft_sample == 0:
+        raise ValueError("Not enough samples per time frame.")
+
+    n_sample = (data_.shape[0] // n_stft_sample) * n_stft_sample
+    n_channel = data_.shape[1]
+    stf_data = view_as_blocks(
+        data_[:n_sample], (n_stft_sample, n_channel)
+    ).squeeze(
+        axis=1
+    )  # (n_stf, N_stft_sample, n_channel)
+
+    window = tukey(M=n_stft_sample, alpha=alpha, sym=True).reshape(1, -1, 1)
+    stf_win_data = stf_data * window  # (n_stf, N_stft_sample, n_channel)
+    n_stf = stf_win_data.shape[0]
+
+    stft_data = np.fft.fft(stf_win_data, axis=1)  # (n_stf, N_stft_sample, n_channel)
+    # Find frequency channels to average together.
+    idx_start = int((fc - 0.5 * bw) * n_stft_sample / rate_)
+    idx_end = int((fc + 0.5 * bw) * n_stft_sample / rate_)
+    collapsed_spectrum = np.sum(stft_data[:, idx_start: idx_end + 1, :], axis=1)
+
+    # Don't understand yet why conj() on first term?
+    return collapsed_spectrum.reshape(n_stf, -1, 1).conj() * collapsed_spectrum.reshape(
+        n_stf, 1, -1
+    )
+
+
+# noinspection PyArgumentList
+def eigh_max(a: np.ndarray):
+    r"""
+    Evaluate :math:`\mu_{\max}(\bbB)` with
+
+    :math:
+    B = (\overline{\bbA} \circ \bbA)^{H} (\overline{\bbA} \circ \bbA)
+    """
+    if a.ndim != 2:
+        raise ValueError('Parameter[A] has wrong dimensions.')
+
+    def matvec(v: np.ndarray):
+        v = v.reshape(-1)
+        c = (a * v) @ a.conj().T
+        d = c @ a
+        return np.sum(a.conj() * d, axis=0).real
+
+    m, n = a.shape
+    b = splinalg.LinearOperator(shape=(n, n), matvec=matvec, dtype=np.float64)
+    d_max = splinalg.eigsh(b, k=1, which='LM', return_eigenvectors=False)
+    return d_max[0]
 
 
 def _solve(functions, x0, solver=None, atol=None, dtol=None, rtol=1e-3, xtol=None, maxit=200, verbosity='LOW'):
@@ -625,11 +708,10 @@ def form_visibility(data, rate, fc, bw, t_sti, t_stationarity):
     Visibilities computed directly in the frequency domain.
     """
     s_sti = (extract_visibilities(data, rate, t_sti, fc, bw, alpha=1.0))
-
     n_sample, n_channel = data.shape
     n_sti_per_stationary_block = int(t_stationarity / t_sti)
     return (
-        skutil.view_as_windows(
+        view_as_windows(
             s_sti,
             window_shape=(n_sti_per_stationary_block, n_channel, n_channel),
             step=(n_sti_per_stationary_block, n_channel, n_channel)
@@ -639,309 +721,21 @@ def form_visibility(data, rate, fc, bw, t_sti, t_stationarity):
     )
 
 
-# noinspection PyUnresolvedReferences
-def wrapped_rad2deg(lat_r: np.ndarray, lon_r: np.ndarray) -> tuple:
-    """
-    Equatorial coordinate [rad] -> [deg] unit conversion.
-    Output longitude guaranteed to lie in [-180, 180) [deg].
-    """
-    lat_d = coord.Angle(lat_r * u.rad).to_value(u.deg)
-    lon_d = coord.Angle(lon_r * u.rad).wrap_at(180 * u.deg).to_value(u.deg)
-    return lat_d, lon_d
-
-
-# noinspection PyUnresolvedReferences
-def cart2pol(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple:
-    """
-    Cartesian coordinates to Polar coordinates.
-    """
-    cart = coord.CartesianRepresentation(x, y, z)
-    sph = coord.SphericalRepresentation.from_cartesian(cart)
-
-    r = sph.distance.to_value(u.dimensionless_unscaled)
-    colat = u.Quantity(90 * u.deg - sph.lat).to_value(u.rad)
-    lon = u.Quantity(sph.lon).to_value(u.rad)
-
-    return r, colat, lon
-
-
-def cart2eq(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple:
-    """
-    Cartesian coordinates to Equatorial coordinates.
-    """
-    r, colat, lon = cart2pol(x, y, z)
-    lat = (np.pi / 2) - colat
-    return r, lat, lon
-
-
-def cmap_from_list(name: list, colors: list, n: int = 256, gamma: float = 1.0):
-    """
-    Create segmented colormap from list of colors.
-    """
-
-    if not isinstance(colors, Iterable):
-        raise ValueError('colors must be iterable')
-
-    # List of value, color pairs
-    if (
-            isinstance(colors[0], Sized) and
-            (len(colors[0]) == 2) and
-            (not isinstance(colors[0], str))
-    ):
-        vals, colors = zip(*colors)
-    else:
-        vals = np.linspace(0, 1, len(colors))
-
-    cdict = dict(red=[], green=[], blue=[], alpha=[])
-    for val, color in zip(vals, colors):
-        r, g, b, a = cm.to_rgba(color)
-        cdict['red'].append((val, r, r))
-        cdict['green'].append((val, g, g))
-        cdict['blue'].append((val, b, b))
-        cdict['alpha'].append((val, a, a))
-
-    return cm.LinearSegmentedColormap(name, cdict, n, gamma)
-
-
-def draw_ellipse(position, covariance, ax=None, **kwargs):
-    """
-    Draw an ellipse with a given position and covariance
-    """
-    ax = ax or plt.gca()
-    # Convert covariance to principal axes
-    if covariance.shape == (2, 2):
-        u_, s, vt = np.linalg.svd(covariance)
-        angle = np.degrees(np.arctan2(u_[1, 0], u_[0, 0]))
-        width, height = 2 * np.sqrt(s)
-        print(width, height)
-    else:
-        angle = 0
-        width, height = 2 * np.sqrt(covariance)
-
-    # Draw the Ellipse
-    for nsig in range(1, 4):
-        ell = mpatches.Ellipse(
-            position,
-            nsig * width,
-            nsig * height,
-            angle,
-            **kwargs
-        )
-        print("Width", ell.width)
-        ax.add_patch(ell)
-
-
-def plot_gmm(
-        gmm: GaussianMixture,
-        x: np.ndarray,
-        label: bool = True,
-        ax: plt.Axes = None
-) -> None:
-    """
-    Plot gaussian mixture model
-    """
-    ax = ax or plt.gca()
-    labels = gmm.fit(x).predict(x)  # noqa
-    if label:
-        ax.scatter(x[:, 0], x[:, 1], c=labels, s=40, cmap='viridis', zorder=2)
-    else:
-        ax.scatter(x[:, 0], x[:, 1], s=40, zorder=2)
-    ax.axis('equal')
-
-    w_factor = 0.2 / gmm.weights_.max()
-    for pos, covar, w in zip(gmm.means_, gmm.covariances_, gmm.weights_):
-        draw_ellipse(pos, covar, alpha=w * w_factor)
-
-
-def draw_map(
-        i: np.ndarray,
-        r: np.ndarray,
-        lon_ticks: np.ndarray,
-        show_labels: bool = False,
-        show_axis: bool = False,
-        fig: plt.Figure = None,
-        ax: plt.Axes = None,
-        kmeans: bool = False,
-        gaussian_mixture: bool = False,
-        az0: list[float] | float = None,
-        el0: list[float] | float = None,
-        mask_radius: float = 30,
-        alpha: float = 0.9
-) -> tuple:
-    """
-    Draw acoustic map with optional angular masking.
-    """
-
-    # Convert coordinate grid to elevation/azimuth (already spherical)
-    _, r_el, r_az = cart2eq(*r)
-    r_el, r_az = wrapped_rad2deg(r_el, r_az)
-    r_el_min, r_el_max = np.around([np.min(r_el), np.max(r_el)])
-    r_az_min, r_az_max = np.around([np.min(r_az), np.max(r_az)])
-
-    # Save original layout
-    orig_pos = ax.get_position()
-    orig_aspect = ax.get_aspect()
-
-    # Basemap init
-    bm = basemap.Basemap(
-        projection='mill',
-        llcrnrlat=r_el_min,
-        urcrnrlat=r_el_max,
-        llcrnrlon=r_az_min,
-        urcrnrlon=r_az_max,
-        resolution='c',
-        ax=ax
-    )
-
-    if show_axis:
-        bm_labels = [1, 0, 0, 1]
-        bm.drawparallels(
-            np.linspace(r_el_min, r_el_max, 5),
-            color='w',
-            dashes=[1, 0],
-            labels=bm_labels,
-            labelstyle='+/-',
-            textcolor='#565656',
-            zorder=0,
-            linewidth=2
-        )
-        bm.drawmeridians(
-            lon_ticks,
-            color='w',
-            dashes=[1, 0],
-            labels=bm_labels,
-            labelstyle='+/-',
-            textcolor='#565656',
-            zorder=0,
-            linewidth=2
-        )
-
-    if show_labels:
-        ax.set_xlabel('Azimuth (degrees)', labelpad=20)
-        ax.set_ylabel('Elevation (degrees)', labelpad=40)
-
-    # Project spherical to 2D basemap coordinates
-    r_x, r_y = bm(r_az, r_el)
-
-    # optional masking
-    if az0 is not None and el0 is not None:
-        if isinstance(az0, float):
-            az0 = np.ndarray([az0])
-        if isinstance(el0, float):
-            el0 = np.ndarray([el0])
-
-        # Convert to radians
-        az1 = np.deg2rad(r_az)
-        el1 = np.deg2rad(r_el)
-        az0r = np.deg2rad(az0)
-        el0r = np.deg2rad(el0)
-
-        # Spherical angular distance
-        ang = np.arccos(
-            np.sin(el0r[:, None]) * np.sin(el1[None, :]) +
-            np.cos(el0r[:, None]) * np.cos(el1[None, :]) * np.cos(az1[None, :] - az0r[:, None])
-        )
-        ang_deg = np.rad2deg(ang)
-
-        # compute mask, use logical OR across rows
-        mask = (ang_deg <= mask_radius).any(axis=0)
-
-        # apply mask
-        i[:, ~mask] = 0
-
-    # triangulation + plotting
-    triangulation = tri.Triangulation(r_x, r_y)
-
-    n_px = i.shape[1]
-    mycmap = cmap_from_list('mycmap', i.T, n=n_px)
-    colors_cmap = np.arange(n_px)
-
-    ax.tripcolor(
-        triangulation,
-        colors_cmap,
-        cmap=mycmap,
-        shading='gouraud',  # removes interpolation patterns
-        edgecolors='none',
-        linewidth=0,
-        alpha=alpha,
-        zorder=100,
-    )
-
-    # annotate the target point (always)
-    if az0 is not None and el0 is not None:
-        for az0_, el0_ in zip(az0, el0):
-            px, py = bm(az0_, el0_)
-            ax.plot(px, py, 'ro', markersize=10, zorder=1000)
-            ax.text(px, py, f" ({az0_}°, {el0_}°)", color="red", fontsize=9, zorder=1000)
-
-    # clustering with kmeans/GMM if required
-    cluster_center = None
-    if kmeans:
-        npts = 18  # find N maximum points
-        i_s = np.square(i).sum(axis=0)
-        max_idx = i_s.argsort()[-npts:][::-1]
-        x_y = np.column_stack((r_x[max_idx], r_y[max_idx]))  # stack N max energy points
-        km_res = KMeans(n_clusters=3).fit(x_y)  # apply k-means to max points
-        # get center of the cluster of N points
-        clusters = km_res.cluster_centers_  # noqa
-        ax.scatter(r_x[max_idx], r_y[max_idx], c='b', s=5)  # plot all N points
-        ax.scatter(clusters[:, 0], clusters[:, 1], s=500, alpha=0.3)  # plot the center as a large point
-        cluster_center = bm(clusters[:, 0][0], clusters[:, 1][0], inverse=True)
-
-    elif gaussian_mixture:
-        npts = 18
-        i_s = np.square(i).sum(axis=0)
-        max_idx = i_s.argsort()[-npts:][::-1]
-        x_y = np.column_stack((r_x[max_idx], r_y[max_idx]))  # stack N max energy points
-        gmm = GaussianMixture(n_components=1, random_state=42)
-        plot_gmm(gmm, x_y)
-
-    # cosmetic cleanup
-    ax.tick_params(left=False, right=False, top=False, bottom=False)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    for txt in ax.texts:
-        txt.set_visible(False)
-
-    # restore axis positions
-    ax.set_position(orig_pos)
-    ax.set(xticklabels=[], yticklabels=[])
-    ax.set_aspect(orig_aspect)
-
-    return fig, ax, cluster_center
-
-
-def to_rgb(i: np.ndarray) -> np.ndarray:
-    """
-    Convert real-valued intensity array (per frequency) with shape (N_band, N_px) to color-band array (3, N_px)
-
-    If N_band > 9, set N_band == 9
-    """
-    n_px = i.shape[1]
-    # Create a copy of the input array if it's going to be modified
-    i_copy = i.copy()
-    if i.shape[0] != 9:
-        i_copy = i_copy[1:10, :]  # grab 9 frequency bands
-    # Reshape and sum to get (3, N_px)
-    return i_copy.reshape((3, 3, n_px)).sum(axis=1)
-
-
 def get_visibility_matrix(
         audio_in: np.ndarray,
         fs: int,
-        apgd: bool = False,
-        t_sti: float = 10e-3,
-        scale: str = "linear",
-        nbands: int = 9,
-        frame_cap: int = None
-) -> tuple:
+        t_sti: float = TSTI,
+        scale: str = SCALE,
+        nbands: int = NBANDS,
+        frame_cap: int = FRAME_CAP,
+        bw: int = BANDWIDTH,
+) -> np.ndarray:
     """
     Compute visibility matrix from audio data.
     """
 
     print("\n=== get_visibility_matrix START ===")
     print(f"Sampling rate: {fs}")
-    print(f"APGD enabled: {apgd}")
     print(f"t_sti: {t_sti}")
     print(f"Scale: {scale}, nbands: {nbands}")
 
@@ -949,11 +743,9 @@ def get_visibility_matrix(
     print("[1/6] Computing frequency bands...")
     # Use spacing between 50 and 4500 Hz as in LAM paper
     if scale == "linear":
-        freq = np.linspace(50, 4500, nbands)
-        bw = 50.0
+        freq = np.linspace(FMIN, FMAX, nbands)
     elif scale == "log":
-        freq = librosa.mel_frequencies(n_mels=nbands, fmin=50, fmax=4500)
-        bw = 50
+        freq = librosa.mel_frequencies(n_mels=nbands, fmin=FMIN, fmax=FMAX)
     else:
         raise Exception("Not a valid scale to generate covariance matrices (log, linear)")
     print(f" → Freq bands: {freq.shape}, Bandwidth: {bw}")
@@ -973,7 +765,6 @@ def get_visibility_matrix(
     n_px = a.shape[1]
     print(f" → Steering matrix A: {a.shape}, n_px={n_px}")
 
-    visibilities = []
     apgd_map = []
 
     print("[5/6] Processing bands...")
@@ -992,7 +783,6 @@ def get_visibility_matrix(
 
         print(f"    → Visibility frames: {n_sample}")
 
-        visibilities_per_frame = []
         apgd_gamma = 0.5
         apgd_per_band = np.zeros((n_sample, n_px))
         i_prev = np.zeros((n_px,))
@@ -1011,552 +801,306 @@ def get_visibility_matrix(
                 s_d = np.clip(s_d / s_d.max(), 0, None)
             s_norm = (s_v * s_d) @ s_v.conj().T
 
-            visibilities_per_frame.append(s_norm)
-
-            if apgd:
-                i_apgd = solve(
-                    s_norm,
-                    a,
-                    gamma=apgd_gamma,
-                    x0=i_prev.copy(),
-                    verbosity='NONE'
-                )
-                apgd_per_band[s_idx] = i_apgd['sol']
-                i_prev = i_apgd['sol']
-            else:
-                apgd_per_band[s_idx] = [0]
+            i_apgd = solve(
+                s_norm,
+                a,
+                gamma=apgd_gamma,
+                x0=i_prev.copy(),
+                verbosity='NONE'
+            )
+            apgd_per_band[s_idx] = i_apgd['sol']
+            i_prev = i_apgd['sol']
 
         apgd_map.append(apgd_per_band)
-        visibilities.append(visibilities_per_frame)
 
     print("\n[6/6] Final assembly...")
-    vis_arr = np.array(visibilities)
     # bands, frames, number of interpolated pixels -> need the tesselation
     apgd_arr = np.array(apgd_map)
 
-    print(f" → Visibility array shape: {vis_arr.shape}")
     print(f" → APGD map shape: {apgd_arr.shape}")
     print("=== get_visibility_matrix END ===\n")
 
-    return vis_arr, apgd_arr, r
+    return apgd_arr
 
 
-def acoustic_map_to_rgb(apgd_arr: np.ndarray, normalize: bool = True, scaling: float = None) -> np.ndarray:
+def create_target_grid(width: int, height: int) -> np.ndarray:
     """
-    Convert intensity map with shape (n_bands, n_frames, n_px) to shape (3, n_frames)
-
-    If normalise, scale so that maximum intensity across all frames == 1
-    If scaling, multiply all values by a constant then clip to within original range
+    Create regular target grid of points based on given width and height
     """
-    ip = np.zeros((apgd_arr.shape[1], 3, apgd_arr.shape[-1]))
-    for fi in range(apgd_arr.shape[1]):
-        vs__ = apgd_arr[:, fi, :]
-        map_vs__ = to_rgb(vs__)
-        ip[fi, :, :] = map_vs__
-
-    # Normalize or not
-    if normalize:
-        ip /= ip.max()
-
-    # Scale by a floating point value then clip to avoid overflow
-    if scaling:
-        orig_min, orig_max = ip.min(), ip.max()
-        ip *= scaling
-        ip = np.clip(ip, orig_min, orig_max)
-
-    return ip
+    target_az = np.linspace(
+        180, -180, width
+    )
+    target_el = np.linspace(
+        90, -90, height
+    )
+    target_az_grid, target_el_grid = np.meshgrid(target_az, target_el, indexing="xy")
+    return np.stack([target_az_grid.ravel(), target_el_grid.ravel()], axis=1)
 
 
-def generate_acoustic_map_video(
-        apgd_arr: np.ndarray,
-        r: np.ndarray,
-        ts: float,
-        f_out: str | Path = None,
-        fig: plt.Figure = None,
-        ax: plt.Figure = None
-) -> FuncAnimation:
+def create_2d_gaussian(
+        cx: int,
+        cy: int,
+        width: int,
+        height: int,
+        circle_radius: int = CIRCLE_RADIUS_DEG,
+) -> np.ndarray:
     """
-    Generate acoustic map as video
+    Compute a 2D Gaussian centered at `cx, cy` pixels.
+
+    The radius of the circle is set to contain 2 SD of the values within the span of (width, height)
     """
-
-    def update(frame_idx: int) -> plt.Axes:
-        # Clear the current canvas
-        ax.clear()
-
-        # Get the current frame from the normalised RGB array
-        vs = ip_norm[frame_idx, :, :]
-
-        # Redraw frame
-        draw_map(
-            r=r,
-            i=vs,
-            lon_ticks=np.linspace(-180, 180, 5),
-            fig=fig,
-            ax=ax,
-            show_labels=False,
-            show_axis=True
+    # Check inputs are valid
+    if not 0 <= cx <= width:
+        raise ValueError(
+            f"X coordinate is outside of width! (x = {cx}, width = {width})"
+        )
+    if not 0 <= cy <= height:
+        raise ValueError(
+            f"Y coordinate is outside of height! (y = {cy}, height = {height})"
         )
 
-        # Set plot aesthetics
-        ax.set(xticks=[], yticks=[], title="Acoustic Map", xticklabels=[], yticklabels=[])
-        ax.invert_xaxis()
-        fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.95)
+    # The circle should contain 2 SD of the vals (68-*95*-99.7% rule)
+    sigma_deg = circle_radius / 2.0
 
-        return ax
+    deg_per_pixel_x = 360.0 / width
+    deg_per_pixel_y = 180.0 / height
 
-    # Convert intensity map to RGB
-    ip_norm = acoustic_map_to_rgb(apgd_arr, normalize=True)
-
-    # Create figure and axis if not already existing
-    if fig is None or ax is None:
-        fig, ax = plt.subplots(1, 1)
-
-    # Need to plot the first frame
-    _ = update(0)
-
-    # Create the animation and save if required
-    anim = FuncAnimation(
-        fig,
-        update,
-        frames=apgd_arr.shape[1],
-        interval=ts,
-        repeat=False
+    _, center_elevation_deg = _equirectangular_to_spherical(
+        cx, cy, width=width, height=height
     )
-    if f_out is not None:
-        anim.save(f_out)
 
-    return anim
+    x, y = np.arange(width), np.arange(height)
+    xx, yy = np.meshgrid(x, y, indexing="xy")  # (H, W)
 
+    # Wrapped pixel deltas (preserve sign)
+    dx = (xx - cx + width / 2) % width - width / 2
+    dy = yy - cy
 
-def create_fibonacci_sphere(n_points=484):
-    """Create approximately uniform points on a sphere using Fibonacci spiral."""
-    indices = np.arange(0, n_points, dtype=float) + 0.5
+    # Convert to angular deltas
+    delta_az_deg = -dx * deg_per_pixel_x  # azimuth increases leftward
+    delta_el_deg = dy * deg_per_pixel_y
 
-    phi = np.arccos(1 - 2 * indices / n_points)
-    theta = np.pi * (1 + 5 ** 0.5) * indices
+    cos_lat = np.cos(np.radians(center_elevation_deg))
 
-    x = np.cos(theta) * np.sin(phi)
-    y = -np.sin(theta) * np.sin(phi)
-    z = np.cos(phi)
+    dist_sq_deg = (delta_el_deg ** 2) + (cos_lat * delta_az_deg) ** 2
 
-    return np.column_stack([x, y, z])
+    gaussian = np.exp(-dist_sq_deg / (2.0 * sigma_deg ** 2))
 
-
-def spherical_to_cartesian(azimuth_deg, elevation_deg):
-    """Convert spherical coordinates to Cartesian (x, y, z)."""
-    az_rad = np.radians(azimuth_deg)
-    el_rad = np.radians(elevation_deg)
-
-    x = np.cos(el_rad) * np.cos(az_rad)
-    y = -np.cos(el_rad) * np.sin(az_rad)
-    z = np.sin(el_rad)
-
-    return x, y, z
+    return gaussian
 
 
-def get_circle_mask(tessellation_coords, azimuth_deg, elevation_deg, radius_deg=20):
+def find_contours(acoustic_image: np.ndarray) -> list[np.ndarray]:
     """
-    Get a boolean mask for tessellation points within a circle around the DOA.
+    Find contours in an equirectangular image. Horizontal wrap-around is handled naturally:
+      - If a blob is split across left/right edges, findContours returns two separate contours
+      - Both contours are kept in the segmentation list
 
     Args:
-        tessellation_coords: Array of shape (n_points, 3) with unit vectors
-        azimuth_deg: Center azimuth in degrees
-        elevation_deg: Center elevation in degrees
-        radius_deg: Radius of circle in degrees
+        acoustic_image (np.ndarray): 2D acoustic image (already scaled/masked)
 
     Returns:
-        Boolean mask of shape (n_points,) where True means inside circle
+        list[np.ndarray]: list of contours
     """
-    # Convert target direction to Cartesian
-    target_x, target_y, target_z = spherical_to_cartesian(azimuth_deg, elevation_deg)
-    target = np.array([target_x, target_y, target_z])
+    # Binary mask
+    binary_mask = (acoustic_image > 0).astype(np.uint8) * 255
 
-    # Calculate angular distances using dot product
-    # For unit vectors: cos(angle) = dot product
-    dot_products = tessellation_coords @ target
+    # Find contours normally
+    contours, _ = cv2.findContours(
+        binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    # Clip to handle numerical errors
-    dot_products = np.clip(dot_products, -1.0, 1.0)
-
-    # Convert to angles in degrees
-    angles_deg = np.degrees(np.arccos(dot_products))
-
-    # Return mask for points within radius
-    return angles_deg <= radius_deg
+    # [(n_coordinates, 2), (n_coordinates, 2), ...]
+    #  this will be len == 1 in all cases BUT when a sound event wraps around both edges of an image
+    return [c.squeeze() for c in contours]
 
 
-# def process_doa_matrix(matrix, metadata, radius_deg: int = 20):
-#     """
-#     Process matrix according to DOA-based masking algorithm.
-#
-#     Args:
-#         matrix: Array of shape (tessellation, bands, frames)
-#         metadata: Array of shape (n_items, 7) with columns [frame_idx, class_idx, source_idx, azimuth, elevation, distance, unique_idx]
-#         radius_deg: Radius of circle around DOA in degrees
-#
-#     Returns:
-#         Processed z-scored and clipped values of shape (tessellation, frames)
-#     """
-#     tessellation, bands, frames = matrix.shape
-#
-#     # Remove metadata rows outside the number of frames in the recording
-#     metadata = metadata[metadata[:, 0] <= frames]
-#
-#     # Create tessellation coordinates
-#     tessellation_coords = create_fibonacci_sphere(tessellation)
-#
-#     # Create a masked copy of the matrix (use np.nan for masked values)
-#     masked_matrix = matrix.astype(float).copy()
-#
-#     # Get unique items
-#     unique_items = np.unique(metadata[:, -1])
-#
-#     for item_idx in unique_items:
-#         # Get all metadata rows for this item
-#         item_metadata = metadata[metadata[:, -1] == item_idx]
-#
-#         # Get frames where this item appears
-#         item_frames = item_metadata[:, 0].astype(int)
-#
-#         # Get DOA for each frame this item appears in
-#         for i, frame_idx in enumerate(item_frames):
-#             azimuth = item_metadata[i, 3]
-#             elevation = item_metadata[i, 4]
-#
-#             # Get circle mask for this DOA
-#             circle_mask = get_circle_mask(tessellation_coords, azimuth, elevation, radius_deg)
-#
-#             # Set all tessellation points OUTSIDE the circle to NaN
-#             # circle_mask is True for inside, so ~circle_mask is True for outside
-#             masked_matrix[~circle_mask, :, frame_idx] = np.nan
-#
-#     # Step 2: Compute median across bands (ignoring NaN)
-#     # Shape: (tessellation, frames)
-#     median_energy = np.nanmedian(masked_matrix, axis=1)
-#
-#     # Step 3: Global z-scoring across all values
-#     # Flatten to compute global statistics
-#     all_values = median_energy.flatten()
-#     valid_values = all_values[~np.isnan(all_values)]
-#
-#     if len(valid_values) == 0:
-#         raise ValueError("No valid values after masking")
-#
-#     global_mean = np.nanmean(valid_values)
-#     global_std = np.nanstd(valid_values)
-#
-#     if global_std == 0:
-#         raise ValueError("Standard deviation is zero, cannot z-score")
-#
-#     z_scored = (median_energy - global_mean) / global_std
-#
-#     # Step 4: Add 0.5 to z-score distribution
-#     z_scored = z_scored + 0.5
-#
-#     # Step 5: Clip between 0 and 1
-#     clipped = np.clip(z_scored, 0, 1)
-#
-#     return clipped
-
-
-def create_circle(elevation, azimuth, radius_deg, angle):
-    lat = np.radians(elevation)
-    lon = np.radians(azimuth)
-    d = np.radians(radius_deg)
-    lat2 = np.arcsin(np.sin(lat) * np.cos(d) +
-                     np.cos(lat) * np.sin(d) * np.cos(angle))
-    lon2 = lon + np.arctan2(np.sin(angle) * np.sin(d) * np.cos(lat),
-                            np.cos(d) - np.sin(lat) * np.sin(lat2))
-    return lat2, lon2
-
-
-def draw_circle_boundary(elevation, azimuth, radius_deg, n_circle_points: int = 100) -> np.ndarray:
-    circle_points = []
-    for angle in np.linspace(0, 2 * np.pi, n_circle_points):
-        circle_points.append(*create_circle(elevation, azimuth, radius_deg, angle))
-    return np.array(circle_points)
-
-
-def visualize_masking(matrix, metadata, frame_idx, radius_deg: int = 20, n_circle_points: int = 100):
+def get_segmentation_pixels(
+        acoustic_image: np.ndarray, contour_boundary: np.ndarray
+) -> list[list]:
     """
-    Visualize the energy on a sphere before and after masking for a specific frame.
-
-    Args:
-        matrix: Array of shape (tessellation, bands, frames)
-        metadata: Array of shape (n_items, 4) with columns [frame_idx, item_idx, azimuth, elevation]
-        frame_idx: Frame to visualize
-        radius_deg: Radius of circle around DOA in degrees
-        n_circle_points: Number of points to draw for the circle
+    Given an acoustic image and contour, compute pixel coordinate values of contour and return list of lists with
+    inner structure [x_coord, y_coord, amplitude]
     """
-    tessellation, bands, frames = matrix.shape
-    tessellation_coords = create_fibonacci_sphere(tessellation)
+    # We can just grab height and width from the acoustic image directly
+    height, width = acoustic_image.shape
 
-    # Convert tessellation coords to spherical for plotting
-    x, y, z = tessellation_coords.T
-    tess_azimuth = np.degrees(np.arctan2(-y, x))
-    tess_elevation = np.degrees(np.arcsin(z))
+    # Compute the mask and fill with the contour boundary
+    mask__ = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(mask__, [contour_boundary.astype(np.int32)], 255)
 
-    # Get energy for this frame (average across bands)
-    energy_before = np.mean(matrix[:, :, frame_idx], axis=1)
+    # Stack to get (x, y, amplitude), with shape (N_coordinates, 3)
+    y_coords, x_coords = np.where(mask__ == 255)
+    amplitude_values = acoustic_image[y_coords, x_coords]
+    pixels_data = np.column_stack([x_coords, y_coords, amplitude_values])
 
-    # Create masked version
-    masked_matrix = matrix[:, :, frame_idx].astype(float).copy()
-
-    # Get all items that appear in this frame
-    frame_metadata = metadata[metadata[:, 0] == frame_idx]
-
-    circles = []  # Store circle parameters for visualization
-
-    if len(frame_metadata) > 0:
-        # Start with all points masked (outside all circles)
-        combined_mask = np.zeros(tessellation, dtype=bool)
-
-        for row in frame_metadata:
-            azimuth, elevation = row[3], row[4]
-
-            # Get circle mask for this DOA
-            circle_mask = get_circle_mask(tessellation_coords, azimuth, elevation, radius_deg)
-            combined_mask |= circle_mask  # Union of all circles
-
-            circles.append((azimuth, elevation))
-
-        # Mask points outside all circles
-        masked_matrix[~combined_mask, :] = np.nan
-
-    # Get energy after masking
-    energy_after = np.nanmean(masked_matrix, axis=1)
-
-    # Create figure with 2 subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6),
-                                   subplot_kw={'projection': 'mollweide'})
-
-    # Plot 1: Before masking
-    scatter1 = ax1.scatter(np.radians(tess_azimuth), np.radians(tess_elevation),
-                           c=energy_before, cmap='viridis', s=20, alpha=0.6)
-    ax1.set_title(f'Frame {frame_idx}: Energy Before Masking', fontsize=14)
-    ax1.set_xlabel('Azimuth (degrees)', fontsize=12)
-    ax1.set_ylabel('Elevation (degrees)', fontsize=12)
-    ax1.grid(True, alpha=0.3)
-    plt.colorbar(scatter1, ax=ax1, label='Energy')
-
-    # Draw circles for each DOA
-    for azimuth, elevation in circles:
-        # Draw circle center
-        ax1.plot(np.radians(azimuth), np.radians(elevation),
-                 'r*', markersize=20, markeredgecolor='white', markeredgewidth=1.5)
-
-        # Draw circle boundary (approximate)
-        circle_points = draw_circle_boundary(elevation, azimuth, radius_deg, n_circle_points)
-        ax1.plot(circle_points[:, 0], circle_points[:, 1], 'r-', linewidth=2, alpha=0.7)
-
-    # Plot 2: After masking
-    # Only plot non-NaN values
-    valid_mask = ~np.isnan(energy_after)
-    scatter2 = ax2.scatter(np.radians(tess_azimuth[valid_mask]),
-                           np.radians(tess_elevation[valid_mask]),
-                           c=energy_after[valid_mask], cmap='viridis', s=20, alpha=0.6)
-    ax2.set_title(f'Frame {frame_idx}: Energy After Masking', fontsize=14)
-    ax2.set_xlabel('Azimuth (degrees)', fontsize=12)
-    ax2.set_ylabel('Elevation (degrees)', fontsize=12)
-    ax2.grid(True, alpha=0.3)
-    plt.colorbar(scatter2, ax=ax2, label='Energy')
-
-    # Draw circles for each DOA
-    for azimuth, elevation in circles:
-        ax2.plot(np.radians(azimuth), np.radians(elevation),
-                 'r*', markersize=20, markeredgecolor='white', markeredgewidth=1.5)
-
-        # Draw circle boundary
-        circle_points = draw_circle_boundary(elevation, azimuth, radius_deg, n_circle_points)
-        ax2.plot(circle_points[:, 0], circle_points[:, 1], 'r-', linewidth=2, alpha=0.7)
-    plt.tight_layout()
-
-    # Print statistics
-    n_masked = np.sum(~valid_mask)
-    n_total = len(energy_after)
-    print(f"\nFrame {frame_idx} Statistics:")
-    print(f"  Number of DOAs in frame: {len(circles)}")
-    if circles:
-        print(f"  DOA positions: {circles}")
-    print(f"  Points masked: {n_masked}/{n_total} ({100 * n_masked / n_total:.1f}%)")
-    print(f"  Energy range before: [{np.min(energy_before):.3f}, {np.max(energy_before):.3f}]")
-    print(f"  Energy range after: [{np.nanmin(energy_after):.3f}, {np.nanmax(energy_after):.3f}]")
-
-    return fig
+    # Return as a list of [x_coord, y_coord, amplitude] lists
+    return [[int(x), int(y), amp] for (x, y, amp) in pixels_data.tolist()]
 
 
-def metadata_frame_to_video_frame(metadata_frame_idx, video_fps=29.97, metadata_fps=10.0):
+def generate_acoustic_image_json(
+        acoustic_image: np.ndarray,
+        metadata: np.ndarray,
+        resolution: tuple[int, int] = RESOLUTION,
+        polygon_mask_threshold: float = POLYGON_MASK_THRESHOLD,
+        circle_radius: int = CIRCLE_RADIUS_DEG,
+) -> list[dict]:
     """
-    Convert metadata frame index to video frame index.
+    Generates a list of dictionaries (JSON-style) for a given acoustic image.
 
-    Args:
-        metadata_frame_idx: Frame index from metadata (100ms resolution = 10 fps)
-        video_fps: Video frames per second (default 29.97)
-        metadata_fps: Metadata frames per second (default 10.0 for 100ms)
+    The function presupposes both an acoustic image with shape (tesselation, bands, frames) and an array of metadata
+    (computed using `audiblelight.synthesize.generate_dcase2024_metadata`, or similar). The method used is as follows:
+        1. Take the median energy for each band in the acoustic image: gives (tesselation, frames)
+        2. Iterate over all frames with an active annotation in the metadata array
+            2a. Interpolate the corresponding acoustic image frame to an image with shape (height, width)
+            2b. Iterate over all annotations for the current frame:
+                2bi. Create a 2D Gaussian centered at the X and Y pixel coordinates of the annotation, with radius set
+                        to span 2SD of all pixel values
+                2bii. Scale the acoustic image frame by multiplying by the Gaussian
+                2biii. Mask all values in the scaled acoustic image frame that are below `polygon_mask_threshold`
+                2biv. Apply contour detection to grab the edges of each "blob" in the image
+            2c. Append all "blobs" for the frame: each of these have the format [x_pixel, y_pixel, amplitude]
+        3. Return a full dictionary containing annotations of every frame
+
+    The dictionaries contain the following keys:
+        - "metadata_frame_index": the index of the frame within the acoustic image
+        - "instance_id": a unique integer identifier for each event in the scene
+        - "category_id": the index of the soundevent
+        - "distance": the distance of the soundevent
+        - "segmentation": a list of [x_pixel, y_pixel, amplitude] values for every segmentation in that frame.
+
+    Note that all but the last value are taken directly from the metadata: only "segemntation" is defined by the
+    acoustic image.
+
+    Finally, it is also assumed that the amplitude values should be scaled *across* multiple JSON files that constitute
+    an entire dataset, e.g. by Z-scoring, scaling between 0 and 1, etc. As this process relies on summary statistics
+    that cannot easily be known when computing individual JSONs, this must be accomplished after calling this function.
+
+    Arguments:
+        acoustic_image (np.ndarray): an acoustic image with shape (tesselation, bands, frames)
+        metadata (np.ndarray): an array of metadata corresponding to the acoustic image
+        resolution (tuple): the resolution to interpolate the image to: must be equirectangular, in form (width, height)
+        polygon_mask_threshold (Numeric): after scaling the acoustic image according to the 2D Gaussian, values below
+            this threshold will be set to 0. This value should be tweaked based on looking at the shape of the images.
+        circle_radius (Numeric): the radius of the circle placed at ground-truth azimuth and elevation points when
+            calculating the 2D Gaussian
 
     Returns:
-        Video frame index (integer)
+        list[dict]: the metadata extracted for this acoustic image
     """
-    # Convert metadata frame to time in seconds
-    time_seconds = metadata_frame_idx / metadata_fps
+    # Validate the acoustic image
+    if not acoustic_image.ndim == 3:
+        raise ValueError(
+            f"Expected acoustic image to have 3 dimensions, but got {acoustic_image.shape}"
+        )
 
-    # Convert time to video frame
-    video_frame_idx = int(time_seconds * video_fps)
+    # Store scene-wide results here
+    scene_res = []
 
-    return video_frame_idx
+    # Unpack acoustic image
+    n_tesselation, n_bands, n_frames = acoustic_image.shape
 
+    # Compute median over bands once for entire acoustic image: shape (tesselation, frames)
+    acoustic_image_medianed = np.median(acoustic_image, axis=1)
 
-def spherical_to_equirectangular(azimuth_deg, elevation_deg, img_width=1920, img_height=960):
-    """
-    Convert spherical coordinates to equirectangular pixel coordinates.
+    # We can infer the `sh_order` used directly from the acoustic image, there's no need to pass it as an argument
+    sh_order = int(math.sqrt(n_tesselation) / 2 - 1)
 
-    Args:
-        azimuth_deg: Azimuth in degrees [-180, 180]
-        elevation_deg: Elevation in degrees [-90, 90]
-        img_width: Image width in pixels
-        img_height: Image height in pixels
+    # Get the tesselation coordinates and convert to spherical: shape (n_px, 2)
+    tesselation = fibonacci(sh_order).T
+    tesselation_eq = np.apply_along_axis(
+        lambda x: _cartesian_to_spherical(*x), 1, tesselation
+    )
 
-    Returns:
-        (x, y) pixel coordinates
-    """
-    # Normalize azimuth from [-180, 180] to [0, img_width]
-    # Azimuth 0° should be at center (x = img_width/2)
-    # Azimuth -180° should be at left edge (x = 0)
-    # Azimuth +180° should be at right edge (x = img_width)
-    x = ((azimuth_deg + 180) % 360) / 360.0 * img_width
+    # Unpack video resolution
+    video_width, video_height = resolution
 
-    # Normalize elevation from [-90, 90] to [0, img_height]
-    # Elevation +90° (up) should be at top (y = 0)
-    # Elevation -90° (down) should be at bottom (y = img_height)
-    y = (90 - elevation_deg) / 180.0 * img_height
+    # Create regular target grid based on (scaled) width and height
+    target_points = create_target_grid(video_width, video_height)
 
-    return int(x), int(y)
+    # Grab frames with ground truth annotations and iterate over these
+    frames_with_gt_annotations = np.unique(metadata[:, 0])
+    for metadata_frame_idx in frames_with_gt_annotations:
 
+        # Grab the corresponding acoustic image frame
+        if metadata_frame_idx >= acoustic_image_medianed.shape[-1]:
+            break
 
-def draw_circle_on_equirectangular(img, azimuth_deg, elevation_deg, radius_deg=20,
-                                   color=(255, 0, 0), thickness=2, n_points=100):
-    """
-    Draw a circle on an equirectangular image.
+        acoustic_image_frame = acoustic_image_medianed[:, metadata_frame_idx]
 
-    Args:
-        img: Image array (H, W, 3)
-        azimuth_deg: Center azimuth in degrees
-        elevation_deg: Center elevation in degrees
-        radius_deg: Radius in degrees
-        color: BGR color tuple
-        thickness: Line thickness
-        n_points: Number of points for circle approximation
+        # Interpolate the acoustic image for this frame and reshape to (height, width)
+        acoustic_image_interpolated = griddata(
+            tesselation_eq,
+            acoustic_image_frame,
+            target_points,
+            method="linear",
+            fill_value=0.0,
+        ).reshape(video_height, video_width)
 
-    Returns:
-        Image with circle drawn
-    """
-    img_height, img_width = img.shape[:2]
+        # Grab the annotations for this frame and iterate over
+        #  We can have multiple annotations per frame, so this will be an array with min len == 1
+        current_frame_metadatas = metadata[metadata[:, 0] == metadata_frame_idx]
+        for metadata_row in current_frame_metadatas:
 
-    # Draw circle boundary
-    circle_points_pixel = []
-    for angle in np.linspace(0, 2 * np.pi, n_points):
-        # Create the circle
+            # Grab everything from the row of metadata
+            _, class_id, instance_id, gt_az, gt_el, gt_dist = metadata_row[:6]
 
-        lat2, lon2 = create_circle(elevation_deg, azimuth_deg, radius_deg, angle)
-        # Convert to degrees
-        az2 = np.degrees(lon2)
-        el2 = np.degrees(lat2)
+            # Convert spherical azimuth/elevation to equirectangular
+            gt_az_eq, gt_el_eq = _spherical_to_equirectangular(
+                gt_az, gt_el, width=video_width, height=video_height
+            )
 
-        # Convert to pixel coordinates
-        x, y = spherical_to_equirectangular(az2, el2, img_width, img_height)
-        circle_points_pixel.append([x, y])
+            # Compute the 2D Gaussian centered at (azimuth, elevation): shape (width, height)
+            gauss_gt = create_2d_gaussian(
+                gt_az_eq,
+                gt_el_eq,
+                width=video_width,
+                height=video_height,
+                circle_radius=circle_radius,
+            )
 
-    # Draw the circle
-    circle_points_pixel = np.array(circle_points_pixel, dtype=np.int32)
-    cv2.polylines(img, [circle_points_pixel], isClosed=True,
-                  color=color, thickness=thickness)
+            # Multiply the acoustic image by the Gaussian to scale it
+            acoustic_image_gauss_scaled = acoustic_image_interpolated * gauss_gt
 
-    # Draw center point
-    center_x, center_y = spherical_to_equirectangular(azimuth_deg, elevation_deg,
-                                                      img_width, img_height)
-    cv2.drawMarker(img, (center_x, center_y), color,
-                   markerType=cv2.MARKER_STAR, markerSize=20, thickness=2)
+            # Mask values in the scaled image that are below the threshold
+            acoustic_image_gauss_masked = acoustic_image_gauss_scaled.copy()
+            polygon_mask = np.where(
+                acoustic_image_gauss_masked < polygon_mask_threshold
+            )
+            acoustic_image_gauss_masked[polygon_mask] = 0
 
-    return img
+            # Find contours within the masked image
+            contours = find_contours(acoustic_image_gauss_masked)
 
+            # We'll store segmentations for this frame inside here
+            segmentations = []
 
-def overlay_doa_on_video_frame(video_path, metadata, metadata_frame_idx,
-                               radius_deg=20, output_path=None):
-    """
-    Overlay DOA annotations on the corresponding video frame.
+            # Iterate over all the contours we've found
+            for contour in contours:
 
-    Args:
-        video_path: Path to the video file
-        metadata: Metadata array with shape (n_items, 7)
-        metadata_frame_idx: Frame index from metadata to visualize
-        radius_deg: Radius of DOA circle in degrees
-        output_path: Optional path to save the annotated frame
+                # skip degenerate contours
+                if contour.ndim == 1:
+                    continue
 
-    Returns:
-        Annotated video frame as numpy array
-    """
-    # Convert metadata frame to video frame
-    video_frame_idx = metadata_frame_to_video_frame(metadata_frame_idx)
+                # Grab the pixels + amplitude values within this segmentation and append to the list
+                pixels_list = get_segmentation_pixels(
+                    acoustic_image_gauss_masked, contour
+                )
+                segmentations.append(pixels_list)
 
-    # Open video
-    cap = cv2.VideoCapture(video_path)
+            # Now we can create the annotations dictionary
+            annotations_dict = {
+                "metadata_frame_index": int(metadata_frame_idx),
+                "instance_id": int(instance_id),
+                "category_id": int(class_id),
+                "segmentation": segmentations,
+                "distance": float(gt_dist),
+            }
+            scene_res.append(annotations_dict)
 
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    print(f"Video FPS: {fps}")
-    print(f"Total video frames: {total_frames}")
-    print(f"Metadata frame {metadata_frame_idx} -> Video frame {video_frame_idx}")
-
-    # Seek to the correct frame
-    cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
-
-    # Read frame
-    ret, frame = cap.read()
-    if not ret:
-        cap.release()
-        raise ValueError(f"Could not read frame {video_frame_idx}")
-
-    # Get all DOAs for this metadata frame
-    frame_metadata = metadata[metadata[:, 0] == metadata_frame_idx]
-
-    # Draw circles for each DOA
-    for row in frame_metadata:
-        azimuth = row[3]
-        elevation = row[4]
-        class_idx = int(row[1])
-
-        # Use different colors for different classes
-        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
-                  (255, 0, 255), (0, 255, 255)]
-        color = colors[class_idx % len(colors)]
-
-        frame = draw_circle_on_equirectangular(frame, azimuth, elevation,
-                                               radius_deg, color=color, thickness=3)
-
-        # Add text label
-        center_x, center_y = spherical_to_equirectangular(azimuth, elevation,
-                                                          frame.shape[1], frame.shape[0])
-        cv2.putText(frame, f"Class {class_idx}", (center_x + 25, center_y - 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    # Add frame info
-    cv2.putText(frame, f"Metadata Frame: {metadata_frame_idx} | Video Frame: {video_frame_idx}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-    cap.release()
-
-    # Save if output path provided
-    if output_path:
-        cv2.imwrite(output_path, frame)
-        print(f"Saved annotated frame to {output_path}")
-
-    return frame
+    return scene_res
 
 
-# why does t_sti need to be 0.01 for 100 ms resolution? Shouldn't it be 0.1?
-def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
+def main(data_src: str, outpath: str) -> None:
     eigenmike_files = [p for p in Path(data_src).rglob("**/*.wav") if "._" not in str(p)]
 
     # Sanitise output directory
@@ -1564,8 +1108,11 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
     if not outdir.exists():
         outdir.mkdir(parents=True)
 
+    # store pixel amplitude distribution here
+    pixel_amps = []
+
     # Iterate over every audio file
-    for clip_name in tqdm(eigenmike_files, desc="Processing files..."):
+    for hdf_idx, clip_name in tqdm(enumerate(eigenmike_files[:2]), total=len(eigenmike_files), desc="Processing files..."):
 
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
@@ -1600,14 +1147,13 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
         print(f"Dumping HDF file to {file_outpath}...")
 
         # compute visibility graph matrix (32ch)
-        _, apgd, __ = get_visibility_matrix(
+        apgd = get_visibility_matrix(
             eigen_sig,
             sr,
-            apgd=True,
-            t_sti=t_sti,
-            scale="log",
-            nbands=2,
-            frame_cap=100
+            t_sti=TSTI,
+            scale=SCALE,
+            nbands=NBANDS,
+            bw=BANDWIDTH
         )
 
         # (tesselation, bands, frames)
@@ -1626,7 +1172,7 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
             f.create_dataset("audio", shape=eigen_sig.shape, dtype=eigen_sig.dtype, data=eigen_sig)
             f.attrs["audio_sr"] = sr
             f.attrs["audio_duration"] = len(eigen_sig) / sr
-            f.attrs["audio_n_frames"] = f.attrs["audio_duration"] / (t_sti * 10)
+            f.attrs["audio_n_frames"] = f.attrs["audio_duration"] / (TSTI * 10)
             f.attrs["audio_fpath"] = str(clip_name)
 
             # metadata
@@ -1642,6 +1188,70 @@ def main(data_src: str, outpath: str, t_sti: float = 0.01) -> None:
 
         # make sure to close the video!
         cap.release()
+
+        # create acoustic image json and dump
+        ai_js = generate_acoustic_image_json(a_np, metadata, )
+
+        this_file_res = {
+            "videos": [
+                {
+                    "id": hdf_idx,
+                    "file_name": clip_name.name,
+                }
+            ],
+            "annotations": ai_js
+        }
+
+        # iterate over all masks
+        for li in ai_js:
+            # iterate over all polygons within the mask
+            for poly in li["segmentation"]:
+                # keep the largest pixel value within the mask
+                poly_arr = np.array(poly)
+                poly_amp = poly_arr[:, -1]
+                pixel_amps.append(np.max(poly_amp))
+
+        # dump the JSON
+        js_path = outpath_with_split / clip_name.with_suffix(".json").name
+        with open(js_path, "w") as f:
+            json.dump(this_file_res, f, indent=4, ensure_ascii=False)
+
+    # Compute summary statistics from all acoustic image JSONs and standardise
+    pixel_arr = np.array(pixel_amps)
+    starss_mu, starss_sd = np.mean(pixel_arr), np.std(pixel_arr)
+
+    print(f"STARSS mean pixel amplitude: {starss_mu}")
+    print(f"STARSS standard deviation pixel amplitude: {starss_sd}")
+
+    # Standardise all the JSONs
+    for js_path in outdir.rglob("**/*.json"):
+        with open(js_path, "r") as js_in:
+            js = json.load(js_in)
+
+        new_res = []
+        for obj_mask in js["annotations"]:
+            std_seg = []
+            for poly in obj_mask["segmentation"]:
+                poly_arr = np.array(poly)
+                poly_amp = poly_arr[:, -1]
+
+                # Z-score
+                poly_amp = (poly_amp - starss_mu) / starss_sd
+
+                # Add 0.5 and clip
+                poly_amp = np.clip(poly_amp + 0.5, 0.01, 1.0)
+
+                # Create new array and replace the amplitude values with standardised version
+                poly_new = poly_arr.copy()
+                poly_new[:, -1] = poly_amp
+
+                std_seg.append(poly_new.tolist())
+            obj_mask["segmentation"] = std_seg
+            new_res.append(obj_mask)
+        js["annotations"] = new_res
+
+        with open(js_path.with_name(js_path.stem + "_std").with_suffix(".json"), "w") as js_out:
+            json.dump(js, js_out, indent=4, ensure_ascii=False)
 
 
 if __name__ == "__main__":

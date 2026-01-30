@@ -21,7 +21,7 @@ from h5py import File
 
 from starss_representations.video.annotate_with_yolos import extract_bounding_boxes, animate_bounding_boxes
 from starss_representations.video.annotate_with_ground_truth_metadata import process_video as ground_truth_annotate, create_annotations_map
-from starss_representations.audio.generate_acoustic_image_dataset import generate_acoustic_map_video, get_visibility_matrix
+from starss_representations.audio.generate_acoustic_image_dataset import get_visibility_matrix
 from starss_representations import utils
 
 DEFAULT_OUTPATH = utils.get_project_root() / "outputs/combined"
@@ -33,6 +33,108 @@ DEFAULT_AUDIO_SCALE = "linear"
 
 # maximum number of frames to process: set to -1 to use all frames
 DEFAULT_FRAME_CAP = -1
+
+
+def to_rgb(i: np.ndarray) -> np.ndarray:
+    """
+    Convert real-valued intensity array (per frequency) with shape (N_band, N_px) to color-band array (3, N_px)
+
+    If N_band > 9, set N_band == 9
+    """
+    n_px = i.shape[1]
+    # Create a copy of the input array if it's going to be modified
+    i_copy = i.copy()
+    if i.shape[0] != 9:
+        i_copy = i_copy[1:10, :]  # grab 9 frequency bands
+    # Reshape and sum to get (3, N_px)
+    return i_copy.reshape((3, 3, n_px)).sum(axis=1)
+
+
+def acoustic_map_to_rgb(apgd_arr: np.ndarray, normalize: bool = True, scaling: float = None) -> np.ndarray:
+    """
+    Convert intensity map with shape (n_bands, n_frames, n_px) to shape (3, n_frames)
+
+    If normalise, scale so that maximum intensity across all frames == 1
+    If scaling, multiply all values by a constant then clip to within original range
+    """
+    ip = np.zeros((apgd_arr.shape[1], 3, apgd_arr.shape[-1]))
+    for fi in range(apgd_arr.shape[1]):
+        vs__ = apgd_arr[:, fi, :]
+        map_vs__ = to_rgb(vs__)
+        ip[fi, :, :] = map_vs__
+
+    # Normalize or not
+    if normalize:
+        ip /= ip.max()
+
+    # Scale by a floating point value then clip to avoid overflow
+    if scaling:
+        orig_min, orig_max = ip.min(), ip.max()
+        ip *= scaling
+        ip = np.clip(ip, orig_min, orig_max)
+
+    return ip
+
+
+def generate_acoustic_map_video(
+        apgd_arr: np.ndarray,
+        r: np.ndarray,
+        ts: float,
+        f_out: str | Path = None,
+        fig: plt.Figure = None,
+        ax: plt.Figure = None
+) -> FuncAnimation:
+    """
+    Generate acoustic map as video
+    """
+
+    def update(frame_idx: int) -> plt.Axes:
+        # Clear the current canvas
+        ax.clear()
+
+        # Get the current frame from the normalised RGB array
+        vs = ip_norm[frame_idx, :, :]
+
+        # Redraw frame
+        draw_map(
+            r=r,
+            i=vs,
+            lon_ticks=np.linspace(-180, 180, 5),
+            fig=fig,
+            ax=ax,
+            show_labels=False,
+            show_axis=True
+        )
+
+        # Set plot aesthetics
+        ax.set(xticks=[], yticks=[], title="Acoustic Map", xticklabels=[], yticklabels=[])
+        ax.invert_xaxis()
+        fig.subplots_adjust(left=0.05, right=0.95, bottom=0.05, top=0.95)
+
+        return ax
+
+    # Convert intensity map to RGB
+    ip_norm = acoustic_map_to_rgb(apgd_arr, normalize=True)
+
+    # Create figure and axis if not already existing
+    if fig is None or ax is None:
+        fig, ax = plt.subplots(1, 1)
+
+    # Need to plot the first frame
+    _ = update(0)
+
+    # Create the animation and save if required
+    anim = FuncAnimation(
+        fig,
+        update,
+        frames=apgd_arr.shape[1],
+        interval=ts,
+        repeat=False
+    )
+    if f_out is not None:
+        anim.save(f_out)
+
+    return anim
 
 
 def main(
