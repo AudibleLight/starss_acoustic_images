@@ -1112,7 +1112,7 @@ def main(data_src: str, outpath: str) -> None:
     pixel_amps = []
 
     # Iterate over every audio file
-    for hdf_idx, clip_name in tqdm(enumerate(eigenmike_files[:2]), total=len(eigenmike_files), desc="Processing files..."):
+    for hdf_idx, clip_name in tqdm(enumerate(eigenmike_files), total=len(eigenmike_files), desc="Processing files..."):
 
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
