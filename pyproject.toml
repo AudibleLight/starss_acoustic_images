@@ -2,6 +2,7 @@
 name = "starss-representations"
 version = "0.1"
 authors = ["Huw Cheston <h.cheston@qmul.ac.uk>", "Iran Roman <i.roman@qmul.ac.uk>"]
+description = "Generate HDF and JSON files from full resolution STARSS23 dataset"
 license = "CC-BY-4.0"
 readme = "README.md"
 

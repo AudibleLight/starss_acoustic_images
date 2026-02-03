@@ -83,11 +83,17 @@ BANDWIDTH = 50.0
 # why does t_sti need to be 0.01 for 100 ms resolution? Shouldn't it be 0.1?
 TSTI = 10e-3
 FRAME_CAP = None
-# FRAME_CAP = 10
+# FRAME_CAP = 500
 SH_ORDER = 10
 CIRCLE_RADIUS_DEG = 20
 POLYGON_MASK_THRESHOLD = 4e-5
 RESOLUTION = 640, 320
+
+# These values are hardcoded and should not be changed
+#  The represent the mean/std of the max pixel amplitude
+#  for every polygon mask in the STARSS training data
+# TODO: these need to be calculated again
+STARSS_MU, STARSS_SIGMA = 6.65586885931554e-05, 2.161661818949044e-05
 
 
 class L2Loss(opt.functions.func):
@@ -794,7 +800,11 @@ def get_visibility_matrix(
                 print(f"        Frame {s_idx + 1}/{n_sample}")
 
             # Eigen-decomposition
-            s_d, s_v = linalg.eigh(s[s_idx])
+            try:
+                s_d, s_v = linalg.eigh(s[s_idx])
+            except IndexError:
+                break
+
             if s_d.max() <= 0:
                 s_d[:] = 0
             else:
@@ -931,10 +941,40 @@ def get_segmentation_pixels(
     # Stack to get (x, y, amplitude), with shape (N_coordinates, 3)
     y_coords, x_coords = np.where(mask__ == 255)
     amplitude_values = acoustic_image[y_coords, x_coords]
+
+    # Need to scale the amplitude values. Process here is:
+    #  1) standardise using hardcoded mu/sigma
+    #  2) add 0.5
+    #  3) clip the result between 0.01 and 1.0
+    # amplitude_values = (amplitude_values - STARSS_MU) / STARSS_SIGMA
+    # amplitude_values_scaled = np.clip(amplitude_values + 0.5, 0.01, 1)
+
+    # stack everything into shape (n_pixels, 3)
     pixels_data = np.column_stack([x_coords, y_coords, amplitude_values])
 
     # Return as a list of [x_coord, y_coord, amplitude] lists
     return [[int(x), int(y), amp] for (x, y, amp) in pixels_data.tolist()]
+
+
+def metadata_frame_to_video_frame(metadata_frame_idx, video_fps: float = 29.97, metadata_fps: float = 10.0):
+    """
+    Convert metadata frame index to video frame index.
+
+    Arguments:
+        metadata_frame_idx: Frame index from metadata (100ms resolution = 10 fps)
+        video_fps: Video frames per second (default 29.97 for STARSS)
+        metadata_fps: Metadata frames per second (default 10.0 for 100ms)
+
+    Returns:
+        Video frame index (integer)
+    """
+    # Convert metadata frame to time in seconds
+    time_seconds = metadata_frame_idx / metadata_fps
+
+    # Convert time to video frame
+    video_frame_idx = int(time_seconds * video_fps)
+
+    return video_frame_idx
 
 
 def generate_acoustic_image_json(
@@ -943,6 +983,7 @@ def generate_acoustic_image_json(
         resolution: tuple[int, int] = RESOLUTION,
         polygon_mask_threshold: float = POLYGON_MASK_THRESHOLD,
         circle_radius: int = CIRCLE_RADIUS_DEG,
+        video_path: str = None
 ) -> list[dict]:
     """
     Generates a list of dictionaries (JSON-style) for a given acoustic image.
@@ -1014,12 +1055,27 @@ def generate_acoustic_image_json(
     # Unpack video resolution
     video_width, video_height = resolution
 
+    # Grab the video
+    # if video_path is not None:
+    #     cap = cv2.VideoCapture(video_path)
+    # else:
+    #     cap = None
+
     # Create regular target grid based on (scaled) width and height
     target_points = create_target_grid(video_width, video_height)
 
     # Grab frames with ground truth annotations and iterate over these
     frames_with_gt_annotations = np.unique(metadata[:, 0])
     for metadata_frame_idx in frames_with_gt_annotations:
+
+        # If we have video: seek to correct frame
+        # if cap is not None and cap.isOpened():
+        #     video_frame_idx = metadata_frame_to_video_frame(metadata_frame_idx)
+        #     cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
+        #     ret, frame = cap.read()
+        #     frame = cv2.resize(frame, (video_width, video_height))
+        # else:
+        #     frame = None
 
         # Grab the corresponding acoustic image frame
         if metadata_frame_idx >= acoustic_image_medianed.shape[-1]:
@@ -1078,7 +1134,7 @@ def generate_acoustic_image_json(
             for contour in contours:
 
                 # skip degenerate contours
-                if contour.ndim == 1:
+                if contour.ndim <= 1:
                     continue
 
                 # Grab the pixels + amplitude values within this segmentation and append to the list
@@ -1087,15 +1143,63 @@ def generate_acoustic_image_json(
                 )
                 segmentations.append(pixels_list)
 
-            # Now we can create the annotations dictionary
-            annotations_dict = {
-                "metadata_frame_index": int(metadata_frame_idx),
-                "instance_id": int(instance_id),
-                "category_id": int(class_id),
-                "segmentation": segmentations,
-                "distance": float(gt_dist),
-            }
-            scene_res.append(annotations_dict)
+                # amplitude_values_scaled = np.array(pixels_list)[:, -1]
+                #
+                # # Plotting test cases
+                # if all([
+                #     cap is not None,
+                #     frame is not None,
+                #     cap.isOpened(),
+                #     any([
+                #         # Test case 1: high mean pixel amplitude
+                #         amplitude_values_scaled.mean() > 0.8,
+                #         # Test case 2: low mean pixel amplitude
+                #         amplitude_values_scaled.mean() < 0.2,
+                #         # Test case 3: avg mean pixel amplitude
+                #         0.425 < amplitude_values_scaled.mean() < 0.675
+                #     ])
+                # ]):
+                #     heatmap = np.zeros((video_height, video_width), dtype=np.float32)
+                #     for x, y, amp in pixels_list:
+                #         x = int(x)
+                #         y = int(y)
+                #         if 0 <= x < video_width and 0 <= y < video_height:
+                #             heatmap[y, x] += amp
+                #     heatmap = np.clip(heatmap, 0.0, 1.0)
+                #     heatmap_uint8 = (heatmap * 255).astype(np.uint8)
+                #     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+                #     alpha = heatmap[..., None]  # shape (H,W,1), values 0–1
+                #     alpha *= 0.35  # scale global transparency
+                #     frame_f = frame.astype(np.float32) / 255.0
+                #     heat_f = heatmap_color.astype(np.float32) / 255.0
+                #     overlay = (1 - alpha) * frame_f + alpha * heat_f
+                #     overlay = (overlay * 255).astype(np.uint8)
+                #     txt = f"{np.min(amplitude_values_scaled):.2f}, {np.mean(amplitude_values_scaled):.2f}, {np.max(amplitude_values_scaled):.2f}"
+                #     cv2.putText(
+                #         overlay,
+                #         txt,
+                #         (50, 50),
+                #         cv2.FONT_HERSHEY_SIMPLEX,
+                #         1,
+                #         (255, 255, 255),
+                #         2,
+                #     )
+                #     tit = f"{np.min(amplitude_values_scaled):.2f}_{np.mean(amplitude_values_scaled):.2f}_{np.max(amplitude_values_scaled):.2f}_{uuid4()}.png"
+                #     cv2.imwrite(tit, overlay)
+
+                # Now we can create the annotations dictionary
+                annotations_dict = {
+                    "metadata_frame_index": int(metadata_frame_idx),
+                    "instance_id": int(instance_id),
+                    "category_id": int(class_id),
+                    "segmentation": segmentations,
+                    "distance": float(gt_dist),
+                }
+                scene_res.append(annotations_dict)
+
+    # Release video reader if we have it
+    # if cap is not None and cap.isOpened():
+    #     cap.release()
 
     return scene_res
 
@@ -1108,14 +1212,8 @@ def main(data_src: str, outpath: str) -> None:
     if not outdir.exists():
         outdir.mkdir(parents=True)
 
-    # store pixel amplitude distribution here
-    pixel_amps = []
-
     # Iterate over every audio file
     for hdf_idx, clip_name in tqdm(enumerate(eigenmike_files), total=len(eigenmike_files), desc="Processing files..."):
-
-        # Load in the WAV file
-        sr, eigen_sig = wavfile.read(clip_name)
 
         # Create folder for split if required
         file_split = clip_name.parent.stem
@@ -1123,11 +1221,23 @@ def main(data_src: str, outpath: str) -> None:
         if not outpath_with_split.exists():
             outpath_with_split.mkdir(parents=True)
 
+        file_outpath = outpath_with_split / clip_name.with_suffix(".hdf").name
+        # if file_outpath.exists():
+            # print(f"Skipping existing file {file_outpath}")
+            # continue
+
         # load up the video for this file
         video_path = str(clip_name.with_suffix(".mp4")).replace("eigen_dev", "video_dev", )
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            raise IOError("Cannot open video file")
+            print(f"Cannot open video file: {video_path}")
+            continue
+
+        js_path = outpath_with_split / (clip_name.stem + ".json")
+        print(f"Dumping JSON to {str(js_path)}")
+
+        # Load in the WAV file
+        sr, eigen_sig = wavfile.read(clip_name)
 
         # get attributes from the video
         video_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1143,7 +1253,6 @@ def main(data_src: str, outpath: str) -> None:
         metadata = metadata.to_numpy()
 
         # Set filepath for this clip
-        file_outpath = outpath_with_split / clip_name.with_suffix(".hdf").name
         print(f"Dumping HDF file to {file_outpath}...")
 
         # compute visibility graph matrix (32ch)
@@ -1186,11 +1295,8 @@ def main(data_src: str, outpath: str) -> None:
             f.attrs["video_resolution"] = (video_width, video_height)
             f.attrs["video_fps"] = video_fps
 
-        # make sure to close the video!
-        cap.release()
-
         # create acoustic image json and dump
-        ai_js = generate_acoustic_image_json(a_np, metadata, )
+        ai_js = generate_acoustic_image_json(a_np, metadata, video_path=video_path)
 
         this_file_res = {
             "videos": [
@@ -1202,56 +1308,9 @@ def main(data_src: str, outpath: str) -> None:
             "annotations": ai_js
         }
 
-        # iterate over all masks
-        for li in ai_js:
-            # iterate over all polygons within the mask
-            for poly in li["segmentation"]:
-                # keep the largest pixel value within the mask
-                poly_arr = np.array(poly)
-                poly_amp = poly_arr[:, -1]
-                pixel_amps.append(np.max(poly_amp))
-
         # dump the JSON
-        js_path = outpath_with_split / clip_name.with_suffix(".json").name
         with open(js_path, "w") as f:
             json.dump(this_file_res, f, indent=4, ensure_ascii=False)
-
-    # Compute summary statistics from all acoustic image JSONs and standardise
-    pixel_arr = np.array(pixel_amps)
-    starss_mu, starss_sd = np.mean(pixel_arr), np.std(pixel_arr)
-
-    print(f"STARSS mean pixel amplitude: {starss_mu}")
-    print(f"STARSS standard deviation pixel amplitude: {starss_sd}")
-
-    # Standardise all the JSONs
-    for js_path in outdir.rglob("**/*.json"):
-        with open(js_path, "r") as js_in:
-            js = json.load(js_in)
-
-        new_res = []
-        for obj_mask in js["annotations"]:
-            std_seg = []
-            for poly in obj_mask["segmentation"]:
-                poly_arr = np.array(poly)
-                poly_amp = poly_arr[:, -1]
-
-                # Z-score
-                poly_amp = (poly_amp - starss_mu) / starss_sd
-
-                # Add 0.5 and clip
-                poly_amp = np.clip(poly_amp + 0.5, 0.01, 1.0)
-
-                # Create new array and replace the amplitude values with standardised version
-                poly_new = poly_arr.copy()
-                poly_new[:, -1] = poly_amp
-
-                std_seg.append(poly_new.tolist())
-            obj_mask["segmentation"] = std_seg
-            new_res.append(obj_mask)
-        js["annotations"] = new_res
-
-        with open(js_path.with_name(js_path.stem + "_std").with_suffix(".json"), "w") as js_out:
-            json.dump(js, js_out, indent=4, ensure_ascii=False)
 
 
 if __name__ == "__main__":
