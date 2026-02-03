@@ -34,6 +34,7 @@ from scipy.signal.windows import tukey
 from scipy.interpolate import griddata
 from skimage.util import view_as_blocks, view_as_windows
 from h5py import File
+from joblib import Parallel, delayed
 
 from starss_representations import utils
 
@@ -88,6 +89,9 @@ SH_ORDER = 10
 CIRCLE_RADIUS_DEG = 20
 POLYGON_MASK_THRESHOLD = 4e-5
 RESOLUTION = 640, 320
+
+# For parallel processing: -1 == use all cores
+N_JOBS = -1
 
 # These values are hardcoded and should not be changed
 #  The represent the mean/std of the max pixel amplitude
@@ -727,6 +731,64 @@ def form_visibility(data, rate, fc, bw, t_sti, t_stationarity):
     )
 
 
+def process_visibility_matrix_band(
+    audio_in: np.ndarray,
+    fc: np.ndarray,
+    fs: float,
+    steering_matrix: np.ndarray,
+    t_sti: float = TSTI,
+    bw: float = BANDWIDTH,
+    frame_cap: int = FRAME_CAP,
+):
+    n_px = steering_matrix.shape[1]
+
+    t_stationarity = 10 * t_sti
+    # print("    → Computing visibility matrices...")
+    s = form_visibility(audio_in, fs, fc, bw, t_sti, t_stationarity)
+    n_sample = s.shape[0]
+
+    # Cap frames if required
+    if frame_cap:
+        s = s[:frame_cap, :, :]
+        n_sample = frame_cap
+
+    # print(f"    → Visibility frames: {n_sample}")
+
+    apgd_gamma = 0.5
+    apgd_per_band = np.zeros((n_sample, n_px))
+    i_prev = np.zeros((n_px,))
+
+    # print("    → Processing frames...")
+    for s_idx in range(n_sample):
+
+        # if s_idx % 20 == 0 or s_idx == n_sample - 1:
+        #     print(f"        Frame {s_idx + 1}/{n_sample}")
+
+        # Eigen-decomposition
+        try:
+            s_d, s_v = linalg.eigh(s[s_idx])
+        except IndexError:
+            break
+
+        if s_d.max() <= 0:
+            s_d[:] = 0
+        else:
+            s_d = np.clip(s_d / s_d.max(), 0, None)
+        s_norm = (s_v * s_d) @ s_v.conj().T
+
+        i_apgd = solve(
+            s_norm,
+            steering_matrix,
+            gamma=apgd_gamma,
+            x0=i_prev.copy(),
+            verbosity='NONE'
+        )
+        apgd_per_band[s_idx] = i_apgd['sol']
+        i_prev = i_apgd['sol']
+
+    return apgd_per_band
+
+
 def get_visibility_matrix(
         audio_in: np.ndarray,
         fs: int,
@@ -774,54 +836,8 @@ def get_visibility_matrix(
     apgd_map = []
 
     print("[5/6] Processing bands...")
-    for i in range(nbands):
-        print(f"\n--- Band {i + 1}/{nbands} | freq={freq[i]:.2f} Hz ---")
-
-        t_stationarity = 10 * t_sti
-        print("    → Computing visibility matrices...")
-        s = form_visibility(audio_in, fs, freq[i], bw, t_sti, t_stationarity)
-        n_sample = s.shape[0]
-
-        # Cap frames if required
-        if frame_cap:
-            s = s[:frame_cap, :, :]
-            n_sample = frame_cap
-
-        print(f"    → Visibility frames: {n_sample}")
-
-        apgd_gamma = 0.5
-        apgd_per_band = np.zeros((n_sample, n_px))
-        i_prev = np.zeros((n_px,))
-
-        print("    → Processing frames...")
-        for s_idx in range(n_sample):
-
-            if s_idx % 20 == 0 or s_idx == n_sample - 1:
-                print(f"        Frame {s_idx + 1}/{n_sample}")
-
-            # Eigen-decomposition
-            try:
-                s_d, s_v = linalg.eigh(s[s_idx])
-            except IndexError:
-                break
-
-            if s_d.max() <= 0:
-                s_d[:] = 0
-            else:
-                s_d = np.clip(s_d / s_d.max(), 0, None)
-            s_norm = (s_v * s_d) @ s_v.conj().T
-
-            i_apgd = solve(
-                s_norm,
-                a,
-                gamma=apgd_gamma,
-                x0=i_prev.copy(),
-                verbosity='NONE'
-            )
-            apgd_per_band[s_idx] = i_apgd['sol']
-            i_prev = i_apgd['sol']
-
-        apgd_map.append(apgd_per_band)
+    with Parallel(n_jobs=N_JOBS, verbose=50) as parallel:
+        apgd_map = parallel(delayed(process_visibility_matrix_band)(audio_in, freq[i], fs, a, t_sti, bw, frame_cap) for i in range(nbands))
 
     print("\n[6/6] Final assembly...")
     # bands, frames, number of interpolated pixels -> need the tesselation
@@ -1223,8 +1239,8 @@ def main(data_src: str, outpath: str) -> None:
 
         file_outpath = outpath_with_split / clip_name.with_suffix(".hdf").name
         # if file_outpath.exists():
-            # print(f"Skipping existing file {file_outpath}")
-            # continue
+        # print(f"Skipping existing file {file_outpath}")
+        # continue
 
         # load up the video for this file
         video_path = str(clip_name.with_suffix(".mp4")).replace("eigen_dev", "video_dev", )
