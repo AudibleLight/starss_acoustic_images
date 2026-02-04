@@ -25,7 +25,6 @@ import numpy as np
 import ijson
 
 from starss_representations import utils
-from starss_representations.audio.generate_acoustic_image_dataset import dynamic_parallel_run
 
 
 # These values are hardcoded and should not be changed
@@ -34,8 +33,6 @@ from starss_representations.audio.generate_acoustic_image_dataset import dynamic
 STARSS_MU, STARSS_SIGMA = 0.0006106861602095730349659024345, 0.0004970147144300498711058668102
 DEFAULT_INPUT_DIRECTORY = utils.get_project_root() / "outputs/apgd_dev"
 DEFAULT_OUTPUT_DIRECTORY = utils.get_project_root() / "outputs/apgd_dev_std"
-
-N_JOBS = -1
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
@@ -67,8 +64,6 @@ def convert_decimals(obj):
 def do_standard(js, output_dir: Path):
     # create output path
     new_js_path = output_dir / (str(js.stem) + "_std.json")
-    new_js_path.parent.mkdir(parents=True, exist_ok=True)
-
     if new_js_path.exists():
         print(f"Skipping file {new_js_path}, exists!")
         return
@@ -123,6 +118,7 @@ def do_standard(js, output_dir: Path):
 def main(input_dir: str, output_dir: str):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
+    utils.create_output_dir_with_subdirs(output_dir, subdirs=utils.DATA_SPLITS)
 
     if not input_dir.exists():
         input_dir.mkdir(parents=True)
@@ -133,7 +129,7 @@ def main(input_dir: str, output_dir: str):
 
     # Dynamic parallel run iteratively reduces workers on crash
     args_list = [(inp, output_dir) for inp in js_files]
-    dynamic_parallel_run(do_standard, args_list, n_jobs=N_JOBS)
+    utils.dynamic_parallel_run(do_standard, args_list,)
 
 
 if __name__ == "__main__":

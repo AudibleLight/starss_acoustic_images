@@ -1,6 +1,5 @@
 *.mp4
 *.csv
-!/starss_representations/audio/spherical_jn_series_threshold.csv
 *.wav
 *.mp3
 *.hdf

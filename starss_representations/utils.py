@@ -6,6 +6,8 @@ from importlib import resources
 
 import numpy as np
 import cv2
+from joblib import Parallel, delayed
+from joblib.externals.loky.process_executor import TerminatedWorkerError
 
 
 # Parameters for video files: taken from paper
@@ -14,11 +16,12 @@ VIDEO_FRAME_TIME = 1 / VIDEO_FPS
 VIDEO_RES = (1920, 960)
 VIDEO_WIDTH, VIDEO_HEIGHT = VIDEO_RES
 VIDEO_RES_RESIZED = (960, 480)
+N_JOBS = -1
 
 # Parameters for matplotlib figures
 DEFAULT_FIG_WIDTH, DEFAULT_FIG_HEIGHT = 10, 5
 
-# Color measured in integers from 0 - 255
+# Color measured in integers from 0 to 255
 MIN_COLOR, MAX_COLOR = 0, 255
 
 # Parameters for audio files: taken from paper
@@ -52,48 +55,6 @@ LABEL_MAPPING = {
 }
 LABEL_MAPPING_INV = {v: k for k, v in LABEL_MAPPING.items()}
 
-DESIRED_FILES = [
-    "dev-test-tau/fold4_room8_mix004",
-    "dev-train-tau/fold3_room6_mix001",
-    "dev-train-tau/fold3_room14_mix003"
-]
-
-
-# Only using first two files from every room for now
-# DESIRED_FILES = [
-#     'dev-test-sony/fold4_room23_mix002',
-#     'dev-test-sony/fold4_room23_mix001',
-#     'dev-test-sony/fold4_room24_mix002',
-#     'dev-test-sony/fold4_room24_mix001',
-#     'dev-train-sony/fold3_room21_mix013',
-#     'dev-train-sony/fold3_room21_mix014',
-#     'dev-train-sony/fold3_room22_mix002',
-#     'dev-train-sony/fold3_room22_mix001',
-#     'dev-test-tau/fold4_room15_mix001',
-#     'dev-test-tau/fold4_room15_mix002',
-#     'dev-test-tau/fold4_room16_mix001',
-#     'dev-test-tau/fold4_room16_mix002',
-#     'dev-test-tau/fold4_room10_mix001',
-#     'dev-test-tau/fold4_room10_mix002',
-#     'dev-test-tau/fold4_room2_mix001',
-#     'dev-test-tau/fold4_room2_mix002',
-#     'dev-test-tau/fold4_room8_mix001',
-#     'dev-test-tau/fold4_room8_mix002',
-#     'dev-train-tau/fold3_room12_mix001',
-#     'dev-train-tau/fold3_room12_mix002',
-#     'dev-train-tau/fold3_room13_mix001',
-#     'dev-train-tau/fold3_room13_mix002',
-#     'dev-train-tau/fold3_room14_mix001',
-#     'dev-train-tau/fold3_room14_mix002',
-#     'dev-train-tau/fold3_room4_mix001',
-#     'dev-train-tau/fold3_room4_mix004',
-#     'dev-train-tau/fold3_room6_mix001',
-#     'dev-train-tau/fold3_room6_mix002',
-#     'dev-train-tau/fold3_room7_mix001',
-#     'dev-train-tau/fold3_room7_mix002',
-#     'dev-train-tau/fold3_room9_mix001',
-#     'dev-train-tau/fold3_room9_mix002',
-# ]
 DATA_SPLITS = [
     "dev-train-tau",
     "dev-test-tau",
@@ -115,134 +76,6 @@ METADATA_PATH = STARSS_ROOT / "metadata_dev"
 EIGEN_PATH = STARSS_ROOT / "eigen_dev"
 
 
-def load_video(
-        video_path: str | Path,
-        grayscale: Optional[bool] = False,
-        resize: Optional[bool] = False
-) -> np.ndarray:
-    """
-    Loads a full video as a numpy array with OpenCV
-
-    Resizing or converting to grayscale are optional.
-    """
-    cap = cv2.VideoCapture(video_path)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # Get correct resizing parameters
-    if resize:
-        width, height = VIDEO_RES_RESIZED
-    else:
-        width, height = VIDEO_RES
-
-    # Create buffer to store frames
-    #  Grayscale buffer has no channel dimension
-    if grayscale:
-        buf = np.empty((frame_count, height, width,), np.dtype('uint8'))
-    else:
-        buf = np.empty((frame_count, height, width, 3), np.dtype('uint8'))
-
-    fc = 0
-    ret = True
-
-    # Keep reading frames until we run out
-    while fc < frame_count and ret:
-        ret, img = cap.read()
-
-        # Apply transforms as required
-        if grayscale:
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if resize:
-            img = cv2.resize(img, (width, height))
-
-        # Update buffer and counter
-        buf[fc] = img
-        fc += 1
-
-    cap.release()
-    return buf
-
-
-# noinspection PyUnresolvedReferences
-def write_video(annotated_video: np.ndarray, outpath: str | Path, fps: float = VIDEO_FPS) -> None:
-    """
-    Writes annotated video to outpath.
-    """
-    # Get parameters from video file
-    width = annotated_video.shape[2]
-    height = annotated_video.shape[1]
-    # Color video has four dimensions
-    is_color = annotated_video.ndim == 4
-
-    # Create output writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out_writer = cv2.VideoWriter(outpath, fourcc, fps, (width, height), isColor=is_color)
-
-    if not out_writer.isOpened():
-        raise ValueError("Could not open video writer")
-
-    # Write all frames sequentially
-    for i in range(annotated_video.shape[0]):
-        out_writer.write(annotated_video[i])
-    out_writer.release()
-
-
-def spherical_to_pixel(azimuth: float, elevation: float, width: float, height: float) -> np.ndarray:
-    """
-    Converts spherical coordinates (azimuth, elevation) to pixel coordinates (x, y) for an equirectangular video frame.
-    """
-    # Azimuth to X conversion
-    x = int(width / 2 - (azimuth * width / 360))
-
-    # Ensure x stays within bounds (0 to width-1)
-    x = max(0, min(width - 1, x))
-
-    # Elevation to Y conversion
-    y = int((90 - elevation) * height / 180)
-
-    # Ensure y stays within bounds (0 to height-1)
-    y = max(0, min(height - 1, y))
-
-    return x, y
-
-
-def interp2d(array: np.ndarray, n_out: int) -> np.ndarray:
-    # Build input and output time axes
-    n_in = len(array)
-    t_in = np.arange(n_in) * 0.1
-    duration = t_in[-1]
-    t_out = np.linspace(0, duration, n_out)
-
-    # Split into individual 1D arrays, interpolate all of them
-    ins = [np.interp(t_out, t_in, array[:, i]) for i in range(array.shape[1])]
-
-    # Stack back to 2D
-    return np.column_stack(ins)
-
-
-def combine_audio_and_video(video_path: str, audio_path: str, output_path: str, cleanup_video: bool = True, cleanup_audio: bool = False) -> None:
-    """
-    Use ffmpeg to combine the temporary annotated video with its original audio track
-    """
-    # Define ffmpeg command and run
-    ffmpeg_command = f"ffmpeg -i {video_path} -i {audio_path} -c:v copy -c:a aac {output_path} -y"
-    out = subprocess.run(
-        ffmpeg_command,
-        shell=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-
-    # Raise on non-zero error code
-    if out.returncode != 0:
-        raise ValueError(f"Returned non-zero exit code from FFmpeg with command {ffmpeg_command}")
-
-    # If cleaning up, remove original (temporary) video path
-    if cleanup_video:
-        os.remove(video_path)
-    if cleanup_audio:
-        os.remove(audio_path)
-
-
 def create_output_dir_with_subdirs(output_dir: str | Path, subdirs: list[str] = None) -> None:
     """
     Sanitise output directory and create if not existing
@@ -256,3 +89,50 @@ def create_output_dir_with_subdirs(output_dir: str | Path, subdirs: list[str] = 
     for split in subdirs:
         if not (output_dir / split).exists():
             (output_dir / split).mkdir()
+
+
+def dynamic_parallel_run(func, args_list: list[tuple] = None, kwargs_list: list[dict] = None, n_jobs: int = N_JOBS):
+    """
+    Run func over a list of argument tuples in parallel, dynamically reducing workers
+    if a TerminatedWorkerError occurs.
+
+    Parameters:
+        func : callable
+            The function to run.
+        args_list : list of tuples
+            Each tuple contains the positional arguments for a single call to func.
+        kwargs_list : list of dicts, optional
+            Each dict contains keyword arguments for the corresponding call.
+        n_jobs : int
+            Number of parallel jobs; -1 means use all CPU cores.
+
+    Returns:
+        List of results.
+    """
+    if args_list is None:
+        args_list = []
+
+    if kwargs_list is None:
+        kwargs_list = [{} for _ in args_list]
+
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
+
+    current_jobs = n_jobs
+
+    while current_jobs > 1:
+        try:
+            print(f"Trying with n_jobs={current_jobs}...")
+            results = Parallel(n_jobs=current_jobs)(
+                delayed(func)(*args_, **kwargs_) for args_, kwargs_ in zip(args_list, kwargs_list)
+            )
+            return results
+        except TerminatedWorkerError:
+            print(f"Workers terminated at n_jobs={current_jobs}. Reducing workers...")
+            if current_jobs == 1:
+                print("Already at 1 job. Running serially...")
+            current_jobs = max(1, current_jobs // 2)
+
+    # Fallback: serial execution if all else fails
+    print("Falling back to serial execution...")
+    return [func(*args_, **kwargs_) for args_, kwargs_ in zip(args_list, kwargs_list)]

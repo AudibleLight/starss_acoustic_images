@@ -14,7 +14,6 @@ use a timescale of 100 ms to match the labelling resolution of the DCASE files.
 import math
 import time
 import json
-import os
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -35,8 +34,6 @@ from scipy.signal.windows import tukey
 from scipy.interpolate import griddata
 from skimage.util import view_as_blocks, view_as_windows
 from h5py import File
-from joblib import Parallel, delayed
-from joblib.externals.loky.process_executor import TerminatedWorkerError
 
 from starss_representations import utils
 
@@ -91,10 +88,6 @@ SH_ORDER = 10
 CIRCLE_RADIUS_DEG = 20
 POLYGON_MASK_THRESHOLD = 4e-5
 RESOLUTION = 640, 320
-
-# For parallel processing: -1 == use all cores
-N_JOBS = -1
-
 
 
 class L2Loss(opt.functions.func):
@@ -786,53 +779,6 @@ def process_visibility_matrix_band(
     return apgd_per_band
 
 
-def dynamic_parallel_run(func, args_list: list[tuple] = None, kwargs_list: list[dict] = None, n_jobs: int = N_JOBS):
-    """
-    Run func over a list of argument tuples in parallel, dynamically reducing workers
-    if a TerminatedWorkerError occurs.
-
-    Parameters:
-        func : callable
-            The function to run.
-        args_list : list of tuples
-            Each tuple contains the positional arguments for a single call to func.
-        kwargs_list : list of dicts, optional
-            Each dict contains keyword arguments for the corresponding call.
-        n_jobs : int
-            Number of parallel jobs; -1 means use all CPU cores.
-
-    Returns:
-        List of results.
-    """
-    if args_list is None:
-        args_list = []
-
-    if kwargs_list is None:
-        kwargs_list = [{} for _ in args_list]
-
-    if n_jobs == -1:
-        n_jobs = os.cpu_count() or 1
-
-    current_jobs = n_jobs
-
-    while current_jobs > 1:
-        try:
-            print(f"Trying with n_jobs={current_jobs}...")
-            results = Parallel(n_jobs=current_jobs)(
-                delayed(func)(*args_, **kwargs_) for args_, kwargs_ in zip(args_list, kwargs_list)
-            )
-            return results
-        except TerminatedWorkerError as e:
-            print(f"Workers terminated at n_jobs={current_jobs}. Reducing workers...")
-            if current_jobs == 1:
-                print("Already at 1 job. Running serially...")
-            current_jobs = max(1, math.ceil(current_jobs / 2))
-
-    # Fallback: serial execution if all else fails
-    print("Falling back to serial execution...")
-    return [func(*args_, **kwargs_) for args_, kwargs_ in zip(args_list, kwargs_list)]
-
-
 def get_visibility_matrix(
         audio_in: np.ndarray,
         fs: int,
@@ -879,7 +825,7 @@ def get_visibility_matrix(
 
     print("[5/6] Processing bands...")
     args_list = [(audio_in, freq[i], fs, a, t_sti, bw, frame_cap) for i in range(nbands)]
-    apgd_map = dynamic_parallel_run(process_visibility_matrix_band, args_list=args_list, n_jobs=N_JOBS)
+    apgd_map = utils.dynamic_parallel_run(process_visibility_matrix_band, args_list=args_list)
 
     print("\n[6/6] Final assembly...")
     # bands, frames, number of interpolated pixels -> need the tesselation
@@ -1049,7 +995,6 @@ def generate_acoustic_image_json(
         resolution: tuple[int, int] = RESOLUTION,
         polygon_mask_threshold: float = POLYGON_MASK_THRESHOLD,
         circle_radius: int = CIRCLE_RADIUS_DEG,
-        video_path: str = None
 ) -> list[dict]:
     """
     Generates a list of dictionaries (JSON-style) for a given acoustic image.
@@ -1362,7 +1307,7 @@ def main(data_src: str, outpath: str) -> None:
             f.attrs["video_fps"] = video_fps
 
         # create acoustic image json and dump
-        ai_js = generate_acoustic_image_json(a_np, metadata, video_path=video_path)
+        ai_js = generate_acoustic_image_json(a_np, metadata)
 
         this_file_res = {
             "videos": [
