@@ -95,10 +95,6 @@ RESOLUTION = 640, 320
 # For parallel processing: -1 == use all cores
 N_JOBS = -1
 
-# These values are hardcoded and should not be changed
-#  The represent the mean/std of the max pixel amplitude
-#  for every polygon mask in the STARSS training data
-STARSS_MU, STARSS_SIGMA = 0.0006106861602095730349659024345, 0.0004970147144300498711058668102
 
 
 class L2Loss(opt.functions.func):

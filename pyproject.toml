@@ -21,6 +21,7 @@ pyunlocbox = "*"
 astropy = "*"
 h5py = "*"
 basemap = "*"
+ijson = "^3.4.0.post0"
 
 [build-system]
 requires = ["poetry-core"]
