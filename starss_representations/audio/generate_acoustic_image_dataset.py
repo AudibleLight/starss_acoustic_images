@@ -98,8 +98,7 @@ N_JOBS = -1
 # These values are hardcoded and should not be changed
 #  The represent the mean/std of the max pixel amplitude
 #  for every polygon mask in the STARSS training data
-# TODO: these need to be calculated again
-STARSS_MU, STARSS_SIGMA = 6.65586885931554e-05, 2.161661818949044e-05
+STARSS_MU, STARSS_SIGMA = 0.0006106861602095730349659024345, 0.0004970147144300498711058668102
 
 
 class L2Loss(opt.functions.func):
