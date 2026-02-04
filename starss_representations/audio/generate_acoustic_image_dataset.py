@@ -14,6 +14,7 @@ use a timescale of 100 ms to match the labelling resolution of the DCASE files.
 import math
 import time
 import json
+import os
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from scipy.interpolate import griddata
 from skimage.util import view_as_blocks, view_as_windows
 from h5py import File
 from joblib import Parallel, delayed
+from joblib.externals.loky.process_executor import TerminatedWorkerError
 
 from starss_representations import utils
 
@@ -789,6 +791,53 @@ def process_visibility_matrix_band(
     return apgd_per_band
 
 
+def dynamic_parallel_run(func, args_list: list[tuple] = None, kwargs_list: list[dict] = None, n_jobs: int = N_JOBS):
+    """
+    Run func over a list of argument tuples in parallel, dynamically reducing workers
+    if a TerminatedWorkerError occurs.
+
+    Parameters:
+        func : callable
+            The function to run.
+        args_list : list of tuples
+            Each tuple contains the positional arguments for a single call to func.
+        kwargs_list : list of dicts, optional
+            Each dict contains keyword arguments for the corresponding call.
+        n_jobs : int
+            Number of parallel jobs; -1 means use all CPU cores.
+
+    Returns:
+        List of results.
+    """
+    if args_list is None:
+        args_list = []
+
+    if kwargs_list is None:
+        kwargs_list = [{} for _ in args_list]
+
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
+
+    current_jobs = n_jobs
+
+    while current_jobs > 1:
+        try:
+            print(f"Trying with n_jobs={current_jobs}...")
+            results = Parallel(n_jobs=current_jobs)(
+                delayed(func)(*args_, **kwargs_) for args_, kwargs_ in zip(args_list, kwargs_list)
+            )
+            return results
+        except TerminatedWorkerError as e:
+            print(f"Workers terminated at n_jobs={current_jobs}. Reducing workers...")
+            if current_jobs == 1:
+                print("Already at 1 job. Running serially...")
+            current_jobs = max(1, math.ceil(current_jobs / 2))
+
+    # Fallback: serial execution if all else fails
+    print("Falling back to serial execution...")
+    return [func(*args_, **kwargs_) for args_, kwargs_ in zip(args_list, kwargs_list)]
+
+
 def get_visibility_matrix(
         audio_in: np.ndarray,
         fs: int,
@@ -833,11 +882,9 @@ def get_visibility_matrix(
     n_px = a.shape[1]
     print(f" → Steering matrix A: {a.shape}, n_px={n_px}")
 
-    apgd_map = []
-
     print("[5/6] Processing bands...")
-    with Parallel(n_jobs=N_JOBS, verbose=50) as parallel:
-        apgd_map = parallel(delayed(process_visibility_matrix_band)(audio_in, freq[i], fs, a, t_sti, bw, frame_cap) for i in range(nbands))
+    args_list = [(audio_in, freq[i], fs, a, t_sti, bw, frame_cap) for i in range(nbands)]
+    apgd_map = dynamic_parallel_run(process_visibility_matrix_band, args_list=args_list, n_jobs=N_JOBS)
 
     print("\n[6/6] Final assembly...")
     # bands, frames, number of interpolated pixels -> need the tesselation
@@ -940,6 +987,15 @@ def find_contours(acoustic_image: np.ndarray) -> list[np.ndarray]:
     return [c.squeeze() for c in contours]
 
 
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    """
+    Applies sigmoid function to an array or scalar input.
+
+    Output is mapped within the range [0, 1.]
+    """
+    return np.exp(-np.logaddexp(0, -x))
+
+
 def get_segmentation_pixels(
         acoustic_image: np.ndarray, contour_boundary: np.ndarray
 ) -> list[list]:
@@ -960,10 +1016,9 @@ def get_segmentation_pixels(
 
     # Need to scale the amplitude values. Process here is:
     #  1) standardise using hardcoded mu/sigma
-    #  2) add 0.5
-    #  3) clip the result between 0.01 and 1.0
+    #  2) apply sigmoid function
     # amplitude_values = (amplitude_values - STARSS_MU) / STARSS_SIGMA
-    # amplitude_values_scaled = np.clip(amplitude_values + 0.5, 0.01, 1)
+    # amplitude_values_scaled = sigmoid(amplitude_values)
 
     # stack everything into shape (n_pixels, 3)
     pixels_data = np.column_stack([x_coords, y_coords, amplitude_values])
@@ -1238,9 +1293,12 @@ def main(data_src: str, outpath: str) -> None:
             outpath_with_split.mkdir(parents=True)
 
         file_outpath = outpath_with_split / clip_name.with_suffix(".hdf").name
-        # if file_outpath.exists():
-        # print(f"Skipping existing file {file_outpath}")
-        # continue
+        js_path = outpath_with_split / (clip_name.stem + ".json")
+        print(f"Dumping JSON to {str(js_path)}")
+
+        if file_outpath.exists() and js_path.exists():
+            print(f"Skipping existing file {file_outpath}")
+            continue
 
         # load up the video for this file
         video_path = str(clip_name.with_suffix(".mp4")).replace("eigen_dev", "video_dev", )
@@ -1248,9 +1306,6 @@ def main(data_src: str, outpath: str) -> None:
         if not cap.isOpened():
             print(f"Cannot open video file: {video_path}")
             continue
-
-        js_path = outpath_with_split / (clip_name.stem + ".json")
-        print(f"Dumping JSON to {str(js_path)}")
 
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
