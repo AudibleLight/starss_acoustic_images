@@ -64,6 +64,8 @@ def convert_decimals(obj):
 def do_standard(js, output_dir: Path):
     # create output path
     new_js_path = output_dir / (str(js.stem) + "_std.json")
+    new_js_path.parent.mkdir(parents=True, exist_ok=True)
+
     if new_js_path.exists():
         print(f"Skipping file {new_js_path}, exists!")
         return
