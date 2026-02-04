@@ -87,7 +87,9 @@ FRAME_CAP = None
 SH_ORDER = 10
 CIRCLE_RADIUS_DEG = 20
 POLYGON_MASK_THRESHOLD = 4e-5
-RESOLUTION = 640, 320
+
+# We assign one pixel per degree
+RESOLUTION = 360, 180
 
 
 class L2Loss(opt.functions.func):
