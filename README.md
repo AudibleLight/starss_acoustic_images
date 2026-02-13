@@ -25,3 +25,7 @@ Ensure that:
 - Metadata is extracted to `data/metadata_dev`
 
 Acoustic images will be saved as `outputs/apgd_dev` and `outputs/apgd_dev_std` (after standardisation).
+
+## Output
+
+![Acoustic Image](https://github.com/AudibleLight/starss_acoustic_images/blob/main/download.png)
