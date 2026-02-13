@@ -30,7 +30,8 @@ from starss_representations import utils
 # These values are hardcoded and should not be changed
 #  The represent the mean/std of the max pixel amplitude
 #  for every polygon mask in the STARSS training data
-STARSS_MU, STARSS_SIGMA = 0.0006106861602095730349659024345, 0.0004970147144300498711058668102
+# STARSS_MU, STARSS_SIGMA = 0.0006106861602095730349659024345, 0.0004970147144300498711058668102
+STARSS_MU, STARSS_SIGMA = 0.0006132456403200415, 0.0004943698488906652
 DEFAULT_INPUT_DIRECTORY = utils.get_project_root() / "outputs/apgd_dev"
 DEFAULT_OUTPUT_DIRECTORY = utils.get_project_root() / "outputs/apgd_dev_std"
 
