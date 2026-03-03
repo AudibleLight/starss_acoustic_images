@@ -14,6 +14,8 @@ use a timescale of 100 ms to match the labelling resolution of the DCASE files.
 import math
 import time
 import json
+import subprocess
+import os
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -33,6 +35,7 @@ from scipy.constants import speed_of_sound
 from scipy.signal.windows import tukey
 from scipy.interpolate import griddata
 from skimage.util import view_as_blocks, view_as_windows
+import soundfile as sf
 from h5py import File
 
 from starss_representations import utils
@@ -71,6 +74,73 @@ EIGENMIKE_COORDS = {
     "31": [122, 270, 0.042],
     "32": [159, 271, 0.042],
 }
+EIGENMIKE64_COORDS = {
+    '1': [16, 197, 0.042],
+    '2': [21, 115, 0.042],
+    '3': [42, 81, 0.042],
+    '4': [13, 313, 0.042],
+    '5': [22, 43, 0.042],
+    '6': [52, 46, 0.042],
+    '7': [37, 335, 0.042],
+    '8': [43, 14, 0.042],
+    '9': [43, 204, 0.042],
+    '10': [70, 206, 0.042],
+    '11': [33, 247, 0.042],
+    '12': [60, 233, 0.042],
+    '13': [56, 264, 0.042],
+    '14': [67, 99, 0.042],
+    '15': [93, 104, 0.042],
+    '16': [48, 120, 0.042],
+    '17': [78, 126, 0.042],
+    '18': [62, 148, 0.042],
+    '19': [38, 162, 0.042],
+    '20': [63, 178, 0.042],
+    '21': [70, 21, 0.042],
+    '22': [96, 25, 0.042],
+    '23': [81, 47, 0.042],
+    '24': [106, 55, 0.042],
+    '25': [67, 71, 0.042],
+    '26': [91, 78, 0.042],
+    '27': [39, 293, 0.042],
+    '28': [68, 290, 0.042],
+    '29': [60, 318, 0.042],
+    '30': [82, 334, 0.042],
+    '31': [63, 352, 0.042],
+    '32': [89, 0, 0.042],
+    '33': [137, 174, 0.042],
+    '34': [139, 212, 0.042],
+    '35': [135, 251, 0.042],
+    '36': [160, 150, 0.042],
+    '37': [162, 240, 0.042],
+    '38': [142, 293, 0.042],
+    '39': [161, 331, 0.042],
+    '40': [162, 60, 0.042],
+    '41': [115, 226, 0.042],
+    '42': [86, 233, 0.042],
+    '43': [116, 193, 0.042],
+    '44': [95, 209, 0.042],
+    '45': [90, 183, 0.042],
+    '46': [111, 163, 0.042],
+    '47': [85, 156, 0.042],
+    '48': [130, 139, 0.042],
+    '49': [102, 135, 0.042],
+    '50': [142, 102, 0.042],
+    '51': [117, 112, 0.042],
+    '52': [117, 83, 0.042],
+    '53': [115, 307, 0.042],
+    '54': [89, 309, 0.042],
+    '55': [118, 278, 0.042],
+    '56': [93, 282, 0.042],
+    '57': [106, 253, 0.042],
+    '58': [81, 260, 0.042],
+    '59': [135, 59, 0.042],
+    '60': [142, 14, 0.042],
+    '61': [120, 32, 0.042],
+    '62': [133, 334, 0.042],
+    '63': [116, 2, 0.042],
+    '64': [107, 335, 0.042]
+}
+
 DEFAULT_EIGEN_DIRECTORY = utils.get_project_root() / "data/eigen_dev"
 DEFAULT_OUTPATH = utils.get_project_root() / "outputs/apgd_dev"
 
@@ -90,6 +160,41 @@ POLYGON_MASK_THRESHOLD = 4e-5
 
 # We assign one pixel per degree
 RESOLUTION = 360, 180
+
+FOURCC = cv2.VideoWriter_fourcc(*"mp4v")    # noqa
+
+CLASS_MAPPING = {
+    "femaleSpeech": 0,
+    "maleSpeech": 1,
+    "clapping": 2,
+    "telephone": 3,
+    "laughter": 4,
+    "domesticSounds": 5,
+    "footsteps": 6,
+    "doorCupboard": 7,
+    "music": 8,
+    "musicInstrument": 9,
+    "waterTap": 10,
+    "bell": 11,
+    "knock": 12,
+}
+CLASS_COLORS = {
+    "femaleSpeech": (255, 192, 203),  # Light pink
+    "maleSpeech": (139, 69, 19),  # Dark blue
+    "clapping": (0, 255, 255),  # Yellow
+    "telephone": (255, 255, 0),  # Cyan
+    "laughter": (0, 165, 255),  # Orange
+    "domesticSounds": (0, 128, 0),  # Green
+    "footsteps": (0, 0, 255),  # Red
+    "doorCupboard": (128, 0, 128),  # Purple
+    "music": (255, 0, 0),  # Blue
+    "musicInstrument": (0, 69, 139),  # Dark red
+    "waterTap": (255, 128, 0),  # Turquoise
+    "bell": (0, 215, 255),  # Gold
+    "knock": (0, 255, 127),  # Spring green
+}
+
+CLASS_MAPPING_INV = {v: k for k, v in CLASS_MAPPING.items()}
 
 
 class L2Loss(opt.functions.func):
@@ -342,8 +447,15 @@ def _spherical_to_equirectangular(
     return int(x), int(y)
 
 
-def get_xyz():
-    mic_coords = _polar_to_cartesian(EIGENMIKE_COORDS, units='degrees')
+def get_xyz(mic: str = "em32"):
+    if mic.lower() == "em32":
+        coords = EIGENMIKE_COORDS
+    elif mic.lower() == "em64":
+        coords = EIGENMIKE64_COORDS
+    else:
+        raise ValueError(f"Expected `mic` to be either 'em32' or 'em64', but got {mic}")
+
+    mic_coords = _polar_to_cartesian(coords, units='degrees')
     xyz = [[coo_ for coo_ in mic_coords[ch]] for ch in mic_coords]
     return xyz
 
@@ -724,13 +836,13 @@ def form_visibility(data, rate, fc, bw, t_sti, t_stationarity):
 
 
 def process_visibility_matrix_band(
-    audio_in: np.ndarray,
-    fc: np.ndarray,
-    fs: float,
-    steering_matrix: np.ndarray,
-    t_sti: float = TSTI,
-    bw: float = BANDWIDTH,
-    frame_cap: int = FRAME_CAP,
+        audio_in: np.ndarray,
+        fc: np.ndarray,
+        fs: float,
+        steering_matrix: np.ndarray,
+        t_sti: float = TSTI,
+        bw: float = BANDWIDTH,
+        frame_cap: int = FRAME_CAP,
 ):
     n_px = steering_matrix.shape[1]
 
@@ -789,6 +901,8 @@ def get_visibility_matrix(
         nbands: int = NBANDS,
         frame_cap: int = FRAME_CAP,
         bw: int = BANDWIDTH,
+        fmin: int = FMIN,
+        fmax: int = FMAX
 ) -> np.ndarray:
     """
     Compute visibility matrix from audio data.
@@ -803,12 +917,13 @@ def get_visibility_matrix(
     print("[1/6] Computing frequency bands...")
     # Use spacing between 50 and 4500 Hz as in LAM paper
     if scale == "linear":
-        freq = np.linspace(FMIN, FMAX, nbands)
+        freq = np.linspace(fmin, fmax, nbands)
     elif scale == "log":
-        freq = librosa.mel_frequencies(n_mels=nbands, fmin=FMIN, fmax=FMAX)
+        freq = librosa.mel_frequencies(n_mels=nbands, fmin=fmin, fmax=fmax)
     else:
         raise Exception("Not a valid scale to generate covariance matrices (log, linear)")
     print(f" → Freq bands: {freq.shape}, Bandwidth: {bw}")
+    print(f" → Min frequency: {fmin} Hz, max frequency: {fmax} Hz")
 
     # --- Field and steering ---
     print("[2/6] Generating spherical field...")
@@ -816,7 +931,9 @@ def get_visibility_matrix(
     print(f" → Field shape: {r.shape}")
 
     print("[3/6] Loading Eigenmike geometry...")
-    xyz = get_xyz()
+    mic = "em32" if audio_in.shape[-1] == 32 else "em64"
+    print(f"   Mic: {mic}")
+    xyz = get_xyz(mic)
     dev_xyz = np.array(xyz).T
     print(f" → Device XYZ shape: {dev_xyz.shape}")
 
@@ -991,6 +1108,75 @@ def metadata_frame_to_video_frame(metadata_frame_idx, video_fps: float = 29.97, 
     return video_frame_idx
 
 
+def plot_frame(
+        metadata_row,
+        acoustic_image_interpolated,
+        metadata_frame_idx: int,
+        video_width: int = RESOLUTION[0],
+        video_height: int = RESOLUTION[1],
+        circle_radius: int = CIRCLE_RADIUS_DEG,
+        polygon_mask_threshold: int = POLYGON_MASK_THRESHOLD
+) -> list[dict]:
+    """
+    Plotting for a single frame
+    """
+    # Grab everything from the row of metadata
+    _, class_id, instance_id, gt_az, gt_el, gt_dist = metadata_row[:6]
+
+    # Convert spherical azimuth/elevation to equirectangular
+    gt_az_eq, gt_el_eq = _spherical_to_equirectangular(
+        gt_az, gt_el, width=video_width, height=video_height
+    )
+
+    # Compute the 2D Gaussian centered at (azimuth, elevation): shape (width, height)
+    gauss_gt = create_2d_gaussian(
+        gt_az_eq,
+        gt_el_eq,
+        width=video_width,
+        height=video_height,
+        circle_radius=circle_radius,
+    )
+
+    # Multiply the acoustic image by the Gaussian to scale it
+    acoustic_image_gauss_scaled = acoustic_image_interpolated * gauss_gt
+
+    # Mask values in the scaled image that are below the threshold
+    acoustic_image_gauss_masked = acoustic_image_gauss_scaled.copy()
+    polygon_mask = np.where(
+        acoustic_image_gauss_masked < polygon_mask_threshold
+    )
+    acoustic_image_gauss_masked[polygon_mask] = 0
+
+    # Find contours within the masked image
+    contours = find_contours(acoustic_image_gauss_masked)
+
+    # We'll store segmentations for this frame inside here
+    segmentations = []
+
+    # Iterate over all the contours we've found
+    for contour in contours:
+
+        # skip degenerate contours
+        if contour.ndim <= 1:
+            continue
+
+        # Grab the pixels + amplitude values within this segmentation and append to the list
+        pixels_list = get_segmentation_pixels(
+            acoustic_image_gauss_masked, contour
+        )
+        segmentations.append(pixels_list)
+
+        # Now we can create the annotations dictionary
+        annotations_dict = {
+            "metadata_frame_index": int(metadata_frame_idx),
+            "instance_id": int(instance_id),
+            "category_id": int(class_id),
+            "segmentation": segmentations,
+            "distance": float(gt_dist),
+        }
+        yield annotations_dict
+
+
 def generate_acoustic_image_json(
         acoustic_image: np.ndarray,
         metadata: np.ndarray,
@@ -1068,27 +1254,17 @@ def generate_acoustic_image_json(
     # Unpack video resolution
     video_width, video_height = resolution
 
-    # Grab the video
-    # if video_path is not None:
-    #     cap = cv2.VideoCapture(video_path)
-    # else:
-    #     cap = None
-
     # Create regular target grid based on (scaled) width and height
     target_points = create_target_grid(video_width, video_height)
 
-    # Grab frames with ground truth annotations and iterate over these
-    frames_with_gt_annotations = np.unique(metadata[:, 0])
-    for metadata_frame_idx in frames_with_gt_annotations:
+    # Grab frames with ground truth annotations
+    if metadata is None:
+        frames_with_gt_annotations = np.arange(n_frames)
+    else:
+        frames_with_gt_annotations = np.unique(metadata[:, 0])
 
-        # If we have video: seek to correct frame
-        # if cap is not None and cap.isOpened():
-        #     video_frame_idx = metadata_frame_to_video_frame(metadata_frame_idx)
-        #     cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
-        #     ret, frame = cap.read()
-        #     frame = cv2.resize(frame, (video_width, video_height))
-        # else:
-        #     frame = None
+    # Iterate over all frames
+    for metadata_frame_idx in tqdm(frames_with_gt_annotations, desc="Generating JSON..."):
 
         # Grab the corresponding acoustic image frame
         if metadata_frame_idx >= acoustic_image_medianed.shape[-1]:
@@ -1107,118 +1283,53 @@ def generate_acoustic_image_json(
 
         # Grab the annotations for this frame and iterate over
         #  We can have multiple annotations per frame, so this will be an array with min len == 1
-        current_frame_metadatas = metadata[metadata[:, 0] == metadata_frame_idx]
-        for metadata_row in current_frame_metadatas:
-
-            # Grab everything from the row of metadata
-            _, class_id, instance_id, gt_az, gt_el, gt_dist = metadata_row[:6]
-
-            # Convert spherical azimuth/elevation to equirectangular
-            gt_az_eq, gt_el_eq = _spherical_to_equirectangular(
-                gt_az, gt_el, width=video_width, height=video_height
-            )
-
-            # Compute the 2D Gaussian centered at (azimuth, elevation): shape (width, height)
-            gauss_gt = create_2d_gaussian(
-                gt_az_eq,
-                gt_el_eq,
-                width=video_width,
-                height=video_height,
-                circle_radius=circle_radius,
-            )
-
-            # Multiply the acoustic image by the Gaussian to scale it
-            acoustic_image_gauss_scaled = acoustic_image_interpolated * gauss_gt
-
-            # Mask values in the scaled image that are below the threshold
-            acoustic_image_gauss_masked = acoustic_image_gauss_scaled.copy()
-            polygon_mask = np.where(
-                acoustic_image_gauss_masked < polygon_mask_threshold
-            )
-            acoustic_image_gauss_masked[polygon_mask] = 0
-
-            # Find contours within the masked image
-            contours = find_contours(acoustic_image_gauss_masked)
-
-            # We'll store segmentations for this frame inside here
-            segmentations = []
-
-            # Iterate over all the contours we've found
-            for contour in contours:
-
-                # skip degenerate contours
-                if contour.ndim <= 1:
-                    continue
-
-                # Grab the pixels + amplitude values within this segmentation and append to the list
-                pixels_list = get_segmentation_pixels(
-                    acoustic_image_gauss_masked, contour
+        if metadata is not None:
+            current_frame_metadatas = metadata[metadata[:, 0] == metadata_frame_idx]
+            for metadata_row in current_frame_metadatas:
+                # Do all plotting for this frame and grab the results
+                out = plot_frame(
+                    metadata_row,
+                    acoustic_image_interpolated,
+                    metadata_frame_idx,
+                    video_width,
+                    video_height,
+                    circle_radius,
+                    polygon_mask_threshold,
                 )
-                segmentations.append(pixels_list)
+                scene_res.extend(list(out))
 
-                # amplitude_values_scaled = np.array(pixels_list)[:, -1]
-                #
-                # # Plotting test cases
-                # if all([
-                #     cap is not None,
-                #     frame is not None,
-                #     cap.isOpened(),
-                #     any([
-                #         # Test case 1: high mean pixel amplitude
-                #         amplitude_values_scaled.mean() > 0.8,
-                #         # Test case 2: low mean pixel amplitude
-                #         amplitude_values_scaled.mean() < 0.2,
-                #         # Test case 3: avg mean pixel amplitude
-                #         0.425 < amplitude_values_scaled.mean() < 0.675
-                #     ])
-                # ]):
-                #     heatmap = np.zeros((video_height, video_width), dtype=np.float32)
-                #     for x, y, amp in pixels_list:
-                #         x = int(x)
-                #         y = int(y)
-                #         if 0 <= x < video_width and 0 <= y < video_height:
-                #             heatmap[y, x] += amp
-                #     heatmap = np.clip(heatmap, 0.0, 1.0)
-                #     heatmap_uint8 = (heatmap * 255).astype(np.uint8)
-                #     heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-                #     alpha = heatmap[..., None]  # shape (H,W,1), values 0–1
-                #     alpha *= 0.35  # scale global transparency
-                #     frame_f = frame.astype(np.float32) / 255.0
-                #     heat_f = heatmap_color.astype(np.float32) / 255.0
-                #     overlay = (1 - alpha) * frame_f + alpha * heat_f
-                #     overlay = (overlay * 255).astype(np.uint8)
-                #     txt = f"{np.min(amplitude_values_scaled):.2f}, {np.mean(amplitude_values_scaled):.2f}, {np.max(amplitude_values_scaled):.2f}"
-                #     cv2.putText(
-                #         overlay,
-                #         txt,
-                #         (50, 50),
-                #         cv2.FONT_HERSHEY_SIMPLEX,
-                #         1,
-                #         (255, 255, 255),
-                #         2,
-                #     )
-                #     tit = f"{np.min(amplitude_values_scaled):.2f}_{np.mean(amplitude_values_scaled):.2f}_{np.max(amplitude_values_scaled):.2f}_{uuid4()}.png"
-                #     cv2.imwrite(tit, overlay)
+        # No metadata: our process for getting the segmentation list can be much simpler
+        else:
+            pixels_list = [(x, y, val) for (x, y), val in np.ndenumerate(acoustic_image_interpolated.T) if val > 0.]
+            annotations_dict = {
+                "metadata_frame_index": int(metadata_frame_idx),
+                "instance_id": None,
+                "category_id": None,
+                "segmentation": pixels_list,
+                "distance": None,
+            }
+            scene_res.append(annotations_dict)
 
-                # Now we can create the annotations dictionary
-                annotations_dict = {
-                    "metadata_frame_index": int(metadata_frame_idx),
-                    "instance_id": int(instance_id),
-                    "category_id": int(class_id),
-                    "segmentation": segmentations,
-                    "distance": float(gt_dist),
-                }
-                scene_res.append(annotations_dict)
-
-    # Release video reader if we have it
-    # if cap is not None and cap.isOpened():
-    #     cap.release()
+    # Need to standardise here
+    if metadata is not None:
+        pass
 
     return scene_res
 
 
-def main(data_src: str, outpath: str) -> None:
-    eigenmike_files = [p for p in Path(data_src).rglob("**/*.wav") if "._" not in str(p)]
+def main(
+        data_src: str,
+        outpath: str,
+        fmin: int,
+        fmax: int,
+        nbands: int,
+        scale: str,
+        bandwidth: float,
+        tsti: float,
+        generate_hdf: bool,
+        generate_json: bool
+) -> None:
+    eigenmike_files = [p for p in Path(data_src).rglob("**/*.wav")]
 
     # Sanitise output directory
     outdir = Path(outpath)
@@ -1242,28 +1353,36 @@ def main(data_src: str, outpath: str) -> None:
             print(f"Skipping existing file {file_outpath}")
             continue
 
-        # load up the video for this file
-        video_path = str(clip_name.with_suffix(".mp4")).replace("eigen_dev", "video_dev", )
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Cannot open video file: {video_path}")
-            continue
-
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
 
-        # get attributes from the video
-        video_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        video_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        # load up the video for this file if we have it
+        video_path = str(clip_name.with_suffix(".mp4")).replace("eigen_dev", "video_dev", )
+        cap = cv2.VideoCapture(video_path)
+
+        # Set some sensible defaults if no video
+        if not cap.isOpened():
+            print(f"Cannot open video file: {video_path}")
+            cap = None
+            video_height = RESOLUTION[1]
+            video_width = RESOLUTION[0]
+            video_fps = utils.VIDEO_FPS
+            video_num_frames = int((eigen_sig.shape[0] / sr) * video_fps)
+        else:
+            video_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_fps = float(cap.get(cv2.CAP_PROP_FPS))
 
         # load in metadata for this file
         metadata_path = str(clip_name.with_suffix(".csv")).replace("eigen_dev", "metadata_dev")
-        metadata = pd.read_csv(metadata_path)
-        metadata.columns = ['frame', 'class_idx', 'source_idx', 'azimuth', 'elevation', 'distance']
-        metadata["unique_source"] = metadata.groupby(["class_idx", "source_idx"]).ngroup()
-        metadata = metadata.to_numpy()
+        if Path(metadata_path).exists():
+            metadata = pd.read_csv(metadata_path)
+            metadata.columns = ['frame', 'class_idx', 'source_idx', 'azimuth', 'elevation', 'distance']
+            metadata["unique_source"] = metadata.groupby(["class_idx", "source_idx"]).ngroup()
+            metadata = metadata.to_numpy()
+        else:
+            metadata = None
 
         # Set filepath for this clip
         print(f"Dumping HDF file to {file_outpath}...")
@@ -1272,43 +1391,49 @@ def main(data_src: str, outpath: str) -> None:
         apgd = get_visibility_matrix(
             eigen_sig,
             sr,
-            t_sti=TSTI,
-            scale=SCALE,
-            nbands=NBANDS,
-            bw=BANDWIDTH
+            t_sti=tsti,
+            scale=scale,
+            nbands=nbands,
+            bw=bandwidth,
+            fmax=fmax,
+            fmin=fmin
         )
 
         # (tesselation, bands, frames)
         a_np = apgd.transpose((2, 0, 1))
 
-        with File(file_outpath, "w") as f:
-            # overall metadata
-            f.attrs["file"] = clip_name.stem
+        if generate_hdf:
+            with File(file_outpath, "w") as f:
+                # overall metadata
+                f.attrs["file"] = clip_name.stem
 
-            # acoustic image
-            f.create_dataset("ai_apgd", shape=a_np.shape, dtype=a_np.dtype, data=a_np)
-            f.attrs["ai_n_frames"] = a_np.shape[0]
-            f.attrs["ai_n_bands"] = a_np.shape[1]
+                # acoustic image
+                f.create_dataset("ai_apgd", shape=a_np.shape, dtype=a_np.dtype, data=a_np)
+                f.attrs["ai_n_frames"] = a_np.shape[0]
+                f.attrs["ai_n_bands"] = a_np.shape[1]
 
-            # audio
-            f.create_dataset("audio", shape=eigen_sig.shape, dtype=eigen_sig.dtype, data=eigen_sig)
-            f.attrs["audio_sr"] = sr
-            f.attrs["audio_duration"] = len(eigen_sig) / sr
-            f.attrs["audio_n_frames"] = f.attrs["audio_duration"] / (TSTI * 10)
-            f.attrs["audio_fpath"] = str(clip_name)
+                # audio
+                f.create_dataset("audio", shape=eigen_sig.shape, dtype=eigen_sig.dtype, data=eigen_sig)
+                f.attrs["audio_sr"] = sr
+                f.attrs["audio_duration"] = len(eigen_sig) / sr
+                f.attrs["audio_n_frames"] = f.attrs["audio_duration"] / (tsti * 10)
+                f.attrs["audio_fpath"] = str(clip_name)
 
-            # metadata
-            f.create_dataset("metadata", shape=metadata.shape, dtype=metadata.dtype, data=metadata)
-            f.attrs["metadata_n_frames"] = metadata[:, 0].max()
-            f.attrs["metadata_fpath"] = str(metadata_path)
+                # metadata
+                if metadata is not None and isinstance(metadata, np.ndarray):
+                    f.create_dataset("metadata", shape=metadata.shape, dtype=metadata.dtype, data=metadata)
+                    f.attrs["metadata_n_frames"] = metadata[:, 0].max()  # noqa
+                    f.attrs["metadata_fpath"] = str(metadata_path)
 
-            # video
-            f.attrs["video_fpath"] = str(video_path)
-            f.attrs["video_n_frames"] = video_num_frames
-            f.attrs["video_resolution"] = (video_width, video_height)
-            f.attrs["video_fps"] = video_fps
+                # video
+                if cap.isOpened():
+                    f.attrs["video_fpath"] = str(video_path)
+                    f.attrs["video_n_frames"] = video_num_frames
+                    f.attrs["video_resolution"] = (video_width, video_height)
+                    f.attrs["video_fps"] = video_fps
 
         # create acoustic image json and dump
+        # TODO: need to do something if metadata doesn't exist
         ai_js = generate_acoustic_image_json(a_np, metadata)
 
         this_file_res = {
@@ -1322,8 +1447,141 @@ def main(data_src: str, outpath: str) -> None:
         }
 
         # dump the JSON
-        with open(js_path, "w") as f:
-            json.dump(this_file_res, f, indent=4, ensure_ascii=False)
+        if generate_json:
+            with open(js_path, "w") as f:
+                json.dump(this_file_res, f, indent=4, ensure_ascii=False)
+
+        # get min/max amplitude
+        all_amps = []
+        for xs in this_file_res["annotations"]:
+            for x in xs["segmentation"]:
+                all_amps.append(x[-1])
+        max_amp, min_amp = np.max(all_amps), np.min(all_amps)
+
+        # Generate the video
+        output_video_path = outpath_with_split / (clip_name.stem + "_.mp4")
+        output_audio_path = outpath_with_split / (clip_name.stem + ".wav")
+        writer = cv2.VideoWriter(output_video_path, FOURCC, video_fps, (video_width, video_height))
+
+        # iterate over all video frame idx
+        for video_frame_idx in tqdm(range(video_num_frames), desc=f"Processing video..."):
+
+            # read the frame: also set resolution and color correctly
+            if cap is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, video_frame_idx)
+                ret, frame = cap.read()
+                frame = cv2.resize(frame, (video_width, video_height))
+
+            # otherwise, dummy frame
+            else:
+                frame = np.zeros((video_height, video_width, 3), dtype=np.uint8)
+
+            # Convert video frame to metadata frame
+            time_seconds = video_frame_idx / video_fps
+            metadata_frame_idx = int(time_seconds * utils.METADATA_FPS)
+
+            # Get metadata rows for this frame
+            current_acoustic_img = [j for j in this_file_res["annotations"] if
+                                    j["metadata_frame_index"] == metadata_frame_idx]
+
+            if metadata is not None:
+                current_metadata_annots = metadata[np.where(metadata[0, :] == metadata_frame_idx)]
+            else:
+                current_metadata_annots = []
+
+            # No annotations: just write the current frame
+            if len(current_acoustic_img) == 0:
+                pass
+
+            # If we have annotations: need to add these on
+            else:
+                # Start with the ground truth metadata labels (from the CSV)
+                for fn, ci, si, azimuth, elevation, distance in current_metadata_annots:
+                    # Map class idx to name
+                    ccls = CLASS_MAPPING_INV[ci]
+
+                    # Add in the annotation
+                    x, y, = _spherical_to_equirectangular(azimuth, elevation, width=video_width, height=video_height)
+                    cv2.circle(frame, (x, y), 5, CLASS_COLORS[ccls], -1)
+
+                    # Add in the text with background
+                    text_size = cv2.getTextSize(ccls, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+                    text_x = x + 50
+                    text_y = y + 50
+                    cv2.rectangle(frame,
+                                  (text_x - 2, text_y - text_size[1] - 2),
+                                  (text_x + text_size[0] + 2, text_y + 2),
+                                  (0, 0, 0), -1)
+                    cv2.putText(frame, ccls, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+                # create the acoustic image
+                #  mask should be (height, width), not (width, height)
+                #  so we have to rearrange some dims
+                aimg = np.zeros((video_height, video_width), dtype=np.float32)
+
+                # now, we iterate through the segmentation and update the mask with the
+                #  standardised amplitude values
+                for seg in current_acoustic_img:
+                    for mask in seg["segmentation"]:
+                        mask_arr = np.array(mask)
+
+                        # only one contour
+                        if mask_arr.ndim == 1:
+                            x, y, a = mask_arr
+                            x, y = int(x), int(y)
+                            a = (a - min_amp) / (max_amp - min_amp)
+                            aimg[y, x] = max(aimg[y, x], a)
+
+                        # multiple contours
+                        else:
+                            for (x, y, a) in mask_arr:
+                                x, y = int(x), int(y)
+                                a = (a - min_amp) / (max_amp - min_amp)
+                                aimg[y, x] = max(aimg[y, x], a)
+
+                aimg_gray = (aimg * 255).astype(np.uint8)
+                aimg_gray = cv2.GaussianBlur(aimg_gray, (15, 15), 0)  # Smooth sparse data
+
+                # Normalize to full 0-255 range for better color variation
+                min_val = aimg_gray.min()
+                max_val = aimg_gray.max()
+                if max_val > min_val:
+                    aimg_gray = cv2.normalize(aimg_gray, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+
+                mask = aimg_gray > 0  # Get mask AFTER blur to capture blurred halo
+                aimg_gray = 255 - aimg_gray  # Invert so red=loud, blue=quiet
+                aimg_col = cv2.applyColorMap(aimg_gray, cv2.COLORMAP_JET)
+                aimg_col = cv2.cvtColor(aimg_col, cv2.COLOR_BGR2RGB)
+
+                # Blend images and apply original mask to preserve empty areas
+                blended = cv2.addWeighted(frame, 1.0, aimg_col, 0.5, 0)
+                frame[mask] = blended[mask]
+
+            writer.write(frame)
+
+        if cap is not None:
+            cap.release()
+        writer.release()
+
+        # grab correct coordinate signal
+        if eigen_sig.shape[-1] == 64:
+            coords = EIGENMIKE64_COORDS
+        else:
+            coords = EIGENMIKE_COORDS
+
+        # grab far right and left audio signals and save to temporary audio
+        far_right = max(coords, key=lambda k: coords.get(k)[1])
+        far_left = min(coords, key=lambda k: coords.get(k)[1])
+        eigen_sig_stereo = eigen_sig[:, [int(far_right) - 1, int(far_left) - 1]]
+        sf.write(output_audio_path, eigen_sig_stereo, sr)
+
+        # mux together
+        cmd = f"ffmpeg -i {str(output_video_path)} -i {str(output_audio_path)} -c:v copy -c:a copy {str(output_video_path).replace('_.mp4', '.mp4')}"
+        subprocess.call(cmd, shell=True)
+
+        # cleanup
+        os.remove(output_audio_path)
+        os.remove(output_video_path)
 
 
 if __name__ == "__main__":
@@ -1341,7 +1599,54 @@ if __name__ == "__main__":
         help="Path to the output HDF5 dataset",
         default=DEFAULT_OUTPATH
     )
-
+    parser.add_argument(
+        "--fmin",
+        type=int,
+        help=f"Minimum frequency, defaults to {FMIN}",
+        default=FMIN
+    )
+    parser.add_argument(
+        "--fmax",
+        type=int,
+        help=f"Maximum frequency, defaults to {FMAX}",
+        default=FMAX
+    )
+    parser.add_argument(
+        "--nbands",
+        type=int,
+        help=f"Number of bands, defaults to {NBANDS}",
+        default=NBANDS
+    )
+    parser.add_argument(
+        "--scale",
+        type=str,
+        help="Scale of computed frequency bands, either 'linear' (default) or 'log'",
+        default=SCALE
+    )
+    parser.add_argument(
+        "--bandwidth",
+        type=float,
+        help=f"Bandwidth to use when computing frequency bands, defaults to {BANDWIDTH}",
+        default=BANDWIDTH
+    )
+    parser.add_argument(
+        "--tsti",
+        type=float,
+        help=f"Frame length to use, defaults to {TSTI}",
+        default=TSTI
+    )
+    parser.add_argument(
+        "--generate-hdf",
+        type=bool,
+        help=f"Whether to generate a HDF file, defaults to False",
+        default=False
+    )
+    parser.add_argument(
+        "--generate-json",
+        type=bool,
+        help=f"Whether to generate a JSON file, defaults to False",
+        default=False
+    )
     # Parse arguments
     args = vars(parser.parse_args())
 
