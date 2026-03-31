@@ -1247,16 +1247,20 @@ def main(data_src: str, outpath: str) -> None:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             print(f"Cannot open video file: {video_path}")
-            continue
+            video_num_frames = None
+            video_height = None
+            video_width = None
+            video_fps = None
+
+        else:
+            # get attributes from the video
+            video_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            video_fps = float(cap.get(cv2.CAP_PROP_FPS))
 
         # Load in the WAV file
         sr, eigen_sig = wavfile.read(clip_name)
-
-        # get attributes from the video
-        video_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        video_fps = float(cap.get(cv2.CAP_PROP_FPS))
 
         # load in metadata for this file
         metadata_path = str(clip_name.with_suffix(".csv")).replace("eigen_dev", "metadata_dev")
@@ -1303,10 +1307,11 @@ def main(data_src: str, outpath: str) -> None:
             f.attrs["metadata_fpath"] = str(metadata_path)
 
             # video
-            f.attrs["video_fpath"] = str(video_path)
-            f.attrs["video_n_frames"] = video_num_frames
-            f.attrs["video_resolution"] = (video_width, video_height)
-            f.attrs["video_fps"] = video_fps
+            if cap.isOpened():
+                f.attrs["video_fpath"] = str(video_path)
+                f.attrs["video_n_frames"] = video_num_frames
+                f.attrs["video_resolution"] = (video_width, video_height)
+                f.attrs["video_fps"] = video_fps
 
         # create acoustic image json and dump
         ai_js = generate_acoustic_image_json(a_np, metadata)
