@@ -1307,10 +1307,11 @@ def main(data_src: str, outpath: str) -> None:
             f.attrs["metadata_fpath"] = str(metadata_path)
 
             # video
-            f.attrs["video_fpath"] = str(video_path)
-            f.attrs["video_n_frames"] = video_num_frames
-            f.attrs["video_resolution"] = (video_width, video_height)
-            f.attrs["video_fps"] = video_fps
+            if cap.isOpened():
+                f.attrs["video_fpath"] = str(video_path)
+                f.attrs["video_n_frames"] = video_num_frames
+                f.attrs["video_resolution"] = (video_width, video_height)
+                f.attrs["video_fps"] = video_fps
 
         # create acoustic image json and dump
         ai_js = generate_acoustic_image_json(a_np, metadata)
